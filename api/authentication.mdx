@@ -1,0 +1,100 @@
+---
+title: "Authenticating with the MeetCost API"
+sidebarTitle: "Authentication"
+description: "Pass an OIDC bearer token or static service token in the Authorization header. Every endpoint except webhooks and /healthz requires authentication."
+---
+
+MeetCost has no user accounts and no password store. Every caller either presents a token issued by your organisation's OIDC identity provider, or a static service token configured by your operator. The server verifies the token, extracts the caller's email, looks up their role, and attaches a `Principal` to the request. A token that cannot be verified is a `401`; a valid token for a role that cannot perform the requested action is a `403`.
+
+## Required header
+
+Every endpoint except `/healthz`, `/readyz`, and the provider webhook receivers requires:
+
+```
+Authorization: Bearer <token>
+```
+
+There is no cookie-based auth, no API key query parameter, and no session management. Every request is independently authenticated.
+
+## OIDC tokens (human callers)
+
+In production, MeetCost verifies bearer tokens as JWTs against your configured OIDC issuer. Set `MEETCOST_OIDC_ISSUER` to your IdP's issuer URL (e.g. `https://accounts.google.com` for Google Workspace, or your Entra tenant endpoint). MeetCost performs OIDC discovery automatically to find the JWKS endpoint.
+
+```bash
+# Example: calling the API with a token your IdP issued
+curl https://meetcost.acme-corp.internal/api/v1/client-config \
+  -H "Authorization: Bearer eyJhbGciOiJSUzI1NiIsInR5..."
+```
+
+The token is verified for:
+- A valid signature against the IdP's published JWKS keys
+- A non-expired `exp` claim
+- The correct `iss` issuer
+- The configured `MEETCOST_OIDC_AUDIENCE` (if set)
+
+MeetCost reads the caller's email from the claim named by `MEETCOST_OIDC_EMAIL_CLAIM` (default: `email`), then falls back to `preferred_username`.
+
+<Note>
+The add-in clients (Google Meet, Zoom, Teams) pass the identity token that the host platform already issued them. End users never handle tokens directly — the add-in passes it automatically.
+</Note>
+
+## Service tokens (machine callers)
+
+Webhook relays, cron jobs, CI pipelines, and any other non-human caller use a static bearer token from `MEETCOST_SERVICE_TOKENS`. This environment variable holds a comma-separated list of `name:token` pairs:
+
+```
+MEETCOST_SERVICE_TOKENS=ci-runner:s3cr3t-token-1,digest-cron:s3cr3t-token-2
+```
+
+A service principal is matched via a constant-time comparison and is always granted the `admin` role. Service tokens should be long random strings, rotated like any privileged secret.
+
+```bash
+# Example: calling the ingest endpoint with a service token
+curl -X POST https://meetcost.acme-corp.internal/api/v1/meetings/ingest \
+  -H "Authorization: Bearer s3cr3t-token-1" \
+  -H "Content-Type: application/json" \
+  -d '{ ... }'
+```
+
+## Development tokens
+
+In a non-production deployment (`MEETCOST_ENVIRONMENT` anything other than `production` or `prod`), you can mint a short-lived development token with:
+
+```bash
+meetcost token ada@example.com
+```
+
+This command prints a HS256-signed JWT that you can pass in the `Authorization` header. Development tokens are **refused in production** — the server returns `401` with the detail `"auth_mode=dev is refused in production"`.
+
+## Role resolution
+
+After the token is verified and the email extracted, MeetCost looks up the caller's role from the `user_roles` table. The absence of a row means `participant` — the least-privileged option, so a directory sync that adds a new person never accidentally grants elevated access.
+
+### Roles
+
+| Role | Who has it | What they can do |
+|---|---|---|
+| `participant` | Everyone by default | Estimate costs, view their own meeting summaries (subject to disclosure policy) |
+| `organiser` | Per-meeting, not a persistent role | See cost totals for meetings they organised |
+| `team_lead` | Assigned by admin | Access reports scoped to their team; view summaries for meetings they weren't in |
+| `finance` | Assigned by admin | Access org-wide reports; view coverage data; optionally view raw pay data |
+| `admin` | Assigned by admin or `MEETCOST_BOOTSTRAP_ADMINS` | Full access to all endpoints including pay upload, config, role management, and audit log |
+
+Roles form a hierarchy: `admin` satisfies any check for `finance`, `team_lead`, `organiser`, or `participant`. `finance` satisfies `team_lead`, and so on.
+
+<Warning>
+Bootstrap admins are set via `MEETCOST_BOOTSTRAP_ADMINS` (a comma-separated list of email addresses). This is the only admin-role grant that does not require an existing admin — use it to grant the first admin before you have UI access.
+</Warning>
+
+## 401 vs 403
+
+- **401 Unauthorized** — The token is missing, malformed, expired, or signed by an unrecognised key. The `WWW-Authenticate: Bearer` header is set. The client should re-authenticate.
+- **403 Forbidden** — The token is valid, but the caller's role does not permit the requested action. Re-authentication will not help; the caller needs a role change.
+
+```json
+// 401 example
+{ "detail": "Invalid token: Signature verification failed" }
+
+// 403 example
+{ "detail": "This endpoint requires the finance role" }
+```

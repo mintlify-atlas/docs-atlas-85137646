@@ -1,0 +1,138 @@
+{
+  "projectType": "saas",
+  "projectName": "MeetCost",
+  "projectDescription": "A self-hosted meeting cost estimator for Google Meet, Zoom, and Teams that calculates payroll cost in real time — payroll data never leaves your infrastructure.",
+  "theme": "luma",
+  "primaryColor": "#2563EB",
+  "lightColor": "#EFF6FF",
+  "darkColor": "#1E3A5F",
+  "navigation": {
+    "tabs": [
+      {
+        "tab": "Documentation",
+        "groups": [
+          {
+            "group": "Get Started",
+            "pages": [
+              "introduction",
+              "quickstart",
+              "architecture"
+            ]
+          },
+          {
+            "group": "Deployment",
+            "pages": [
+              "deployment/docker",
+              "deployment/kubernetes",
+              "deployment/configuration",
+              "deployment/identity"
+            ]
+          },
+          {
+            "group": "Features",
+            "pages": [
+              "features/cost-estimation",
+              "features/meeting-summaries",
+              "features/reports",
+              "features/admin"
+            ]
+          },
+          {
+            "group": "Privacy & Security",
+            "pages": [
+              "security/data-protection",
+              "security/permissions",
+              "security/privacy"
+            ]
+          },
+          {
+            "group": "Integrations",
+            "pages": [
+              "integrations/google-meet",
+              "integrations/zoom",
+              "integrations/teams",
+              "integrations/adapters"
+            ]
+          }
+        ]
+      },
+      {
+        "tab": "API Reference",
+        "groups": [
+          {
+            "group": "Overview",
+            "pages": [
+              "api/overview",
+              "api/authentication"
+            ]
+          },
+          {
+            "group": "Endpoints",
+            "pages": [
+              "api/estimate",
+              "api/meetings",
+              "api/reports",
+              "api/admin",
+              "api/webhooks"
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "keyFeatures": [
+    "Real-time scheduling-time cost estimates with annualised figures for recurring meetings",
+    "Post-meeting summaries based on actual attendance and actual duration",
+    "Weekly and monthly cost digests by team and org-wide with CSV export",
+    "Pay data encrypted at rest with AES-256-GCM under an operator-supplied key",
+    "Role-based disclosure controls with salary-inference protections for small meetings",
+    "Full audit log of every pay-data access",
+    "Egress allowlist enforced at the socket layer — no payroll data leaves the deployment",
+    "Adapters for Google Workspace, Microsoft 365, Zoom directories, and BambooHR HRIS",
+    "Helm chart and Docker Compose for self-hosted deployment",
+    "CLI for key generation, database seeding, syncs, digests, and pay import"
+  ],
+  "publicApiSurface": [
+    "POST /api/v1/estimate",
+    "POST /api/v1/estimate/commit",
+    "GET /api/v1/meetings/{meeting_id}/summary",
+    "GET /api/v1/meetings/by-provider/{provider}/{provider_meeting_id}/summary",
+    "GET /api/v1/meetings/mine",
+    "POST /api/v1/meetings/ingest",
+    "GET /api/v1/reports",
+    "GET /api/v1/reports/export.csv",
+    "POST /api/v1/admin/pay/upload",
+    "POST /api/v1/admin/pay",
+    "GET /api/v1/admin/pay",
+    "GET /api/v1/admin/pay/export.csv",
+    "DELETE /api/v1/admin/pay/{email}",
+    "GET /api/v1/admin/coverage",
+    "GET /api/v1/admin/config",
+    "PATCH /api/v1/admin/config",
+    "GET /api/v1/admin/roles",
+    "PUT /api/v1/admin/roles",
+    "DELETE /api/v1/admin/roles",
+    "GET /api/v1/admin/audit",
+    "GET /api/v1/admin/adapters",
+    "POST /api/v1/admin/sync/directory",
+    "POST /api/v1/admin/sync/hris",
+    "POST /webhooks/zoom",
+    "POST /webhooks/microsoft",
+    "POST /webhooks/google/poll",
+    "GET /healthz",
+    "GET /readyz",
+    "GET /api/v1/client-config",
+    "meetcost genkey",
+    "meetcost serve",
+    "meetcost initdb",
+    "meetcost config",
+    "meetcost token <email>",
+    "meetcost grant <email> <role>",
+    "meetcost sync-directory",
+    "meetcost sync-hris",
+    "meetcost collect <provider>",
+    "meetcost digest",
+    "meetcost import-pay <path>",
+    "meetcost seed-demo"
+  ]
+}

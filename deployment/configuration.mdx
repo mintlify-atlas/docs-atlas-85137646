@@ -1,0 +1,305 @@
+---
+title: "MeetCost Environment Variable Reference"
+sidebarTitle: "Configuration"
+description: "Complete reference for MeetCost environment variables covering core settings, authentication, rate engine, policy defaults, integrations, and egress control."
+---
+
+MeetCost is configured entirely through environment variables with the `MEETCOST_` prefix. All variables are read from the process environment or from a `.env` file in the working directory at startup. There is no configuration file format beyond `.env` — this keeps secrets manageable via standard secret injection patterns without any MeetCost-specific tooling.
+
+Configuration is split into two zones. **Deployment settings** — database URL, cryptographic keys, allowed egress hosts — are read once at boot and never change without a restart. **Rate and policy defaults** — loading factor, cost thresholds, disclosure permissions — are seeded from environment variables on first boot, but the authoritative value lives in the `org_config` table so an admin can update them at runtime without a redeploy.
+
+## Printing effective configuration
+
+Use the `meetcost config` CLI command to print the current effective configuration. All secrets are automatically redacted:
+
+```bash
+meetcost config
+```
+
+```json
+{
+  "environment": "production",
+  "log_level": "INFO",
+  "database_url": "postgresql+psycopg://meetcost:***@postgres:5432/meetcost",
+  "encryption_key": "***",
+  "secret_key": "***",
+  "public_base_url": "https://meetcost.your-company.example",
+  "auth_mode": "oidc",
+  "oidc_issuer": "https://accounts.google.com",
+  "egress_allowlist": ["accounts.google.com", "admin.googleapis.com", "..."]
+}
+```
+
+Fields containing `key`, `secret`, `password`, or `token` in their name are replaced with `***`. The computed `egress_allowlist` is appended to the output so you can verify exactly which hosts the service is allowed to reach.
+
+---
+
+## Core
+
+<ParamField body="MEETCOST_ENVIRONMENT" type="string" default="production">
+  Runtime environment. Accepted values: `production`, `prod`, `development`. Setting this to `development` disables the production startup guards and enables developer-only commands (`meetcost token`, `seed-demo`). The Docker runtime image sets `MEETCOST_ENVIRONMENT=production` as a default — you must actively override it for local work.
+</ParamField>
+
+<ParamField body="MEETCOST_DATABASE_URL" type="string" default="sqlite+pysqlite:///./meetcost.db">
+  SQLAlchemy database URL. SQLite is the default and is acceptable for local trials. Use Postgres 14 or newer in production:
+
+  ```
+  postgresql+psycopg://meetcost:PASSWORD@hostname:5432/meetcost
+  ```
+
+  SQLite money columns are float-backed, which means long-running aggregates can drift by fractions of a cent. Do not use SQLite in production.
+</ParamField>
+
+<ParamField body="MEETCOST_ENCRYPTION_KEY" type="string" default="None">
+  Base64-encoded 32-byte key used to encrypt all pay values at rest with AES-256-GCM. Generate with `meetcost genkey`. **Required in production.** MeetCost cannot recover data without it — back it up in a separate location from your database.
+</ParamField>
+
+<ParamField body="MEETCOST_SECRET_KEY" type="string" default="change-me-in-production">
+  Signing key for admin sessions and development-mode tokens. **Must be changed before production use.** Generate a suitable value with `openssl rand -base64 48`. MeetCost will refuse to start in production if this is left at its default.
+</ParamField>
+
+<ParamField body="MEETCOST_PUBLIC_BASE_URL" type="string" default="http://localhost:8000">
+  The public origin of this service, e.g. `https://meetcost.acme-corp.internal`. Clients are configured with this URL and will communicate with no other origin. Used to build absolute URLs in digest emails and add-in manifests.
+</ParamField>
+
+<ParamField body="MEETCOST_LOG_LEVEL" type="string" default="INFO">
+  Logging verbosity passed to uvicorn. Accepted values: `DEBUG`, `INFO`, `WARNING`, `ERROR`, `CRITICAL`. Logs are structured text written to stdout. No pay figures appear in logs.
+</ParamField>
+
+---
+
+## Authentication
+
+<ParamField body="MEETCOST_AUTH_MODE" type="string" default="oidc">
+  Token verification mode. `oidc` verifies bearer tokens against your identity provider using OIDC discovery. `dev` accepts locally-signed tokens and is **refused when `MEETCOST_ENVIRONMENT=production`**. Always use `oidc` in production.
+</ParamField>
+
+<ParamField body="MEETCOST_OIDC_ISSUER" type="string" default="None">
+  The OIDC issuer URL for your identity provider. MeetCost fetches JWKS automatically from `<issuer>/.well-known/openid-configuration`. **Required when `auth_mode=oidc`.**
+
+  | Provider | Value |
+  |---|---|
+  | Google Workspace | `https://accounts.google.com` |
+  | Microsoft 365 | `https://login.microsoftonline.com/<tenant-id>/v2.0` |
+  | Okta | `https://<your-domain>.okta.com` |
+  | Keycloak | `https://<keycloak-host>/realms/<realm>` |
+</ParamField>
+
+<ParamField body="MEETCOST_OIDC_AUDIENCE" type="string" default="None">
+  The audience (`aud` claim) that tokens must be issued for. For Google, this is your OAuth app's client ID. For Microsoft Entra, this is your application (client) ID. MeetCost rejects tokens whose `aud` does not match this value.
+</ParamField>
+
+<ParamField body="MEETCOST_OIDC_JWKS_URL" type="string" default="None">
+  Override the JWKS URL instead of deriving it from OIDC discovery. Only needed if your identity provider does not expose a standard discovery document. Leave unset in most cases.
+</ParamField>
+
+<ParamField body="MEETCOST_OIDC_EMAIL_CLAIM" type="string" default="email">
+  The JWT claim that contains the user's email address. The default (`email`) works for Google, Microsoft, Okta, and Keycloak in their standard configurations. Set this if your identity provider puts the email address under a non-standard claim name.
+</ParamField>
+
+<ParamField body="MEETCOST_SERVICE_TOKENS" type="string" default="">
+  Static bearer tokens for machine callers such as cron jobs and webhook relays. Format: `name:token` pairs, comma-separated. Example:
+
+  ```bash
+  MEETCOST_SERVICE_TOKENS=digest-cron:$(openssl rand -hex 32),collector:$(openssl rand -hex 32)
+  ```
+
+  Tokens are matched in constant time. They carry admin-level rights — treat them as admin credentials and rotate them on the same schedule. See the [Identity guide](/deployment/identity) for more detail.
+</ParamField>
+
+<ParamField body="MEETCOST_BOOTSTRAP_ADMINS" type="string" default="">
+  Comma-separated email addresses granted the `admin` role at startup, before any role rows exist in the database. Useful for the first login after a fresh deployment. Once an admin has logged in and can manage roles through the UI or `meetcost grant`, this variable is no longer needed (but leaving it set is harmless).
+</ParamField>
+
+---
+
+## Rate Engine
+
+These values seed the `org_config` table on first boot. After that, an admin can update them through the UI without a redeploy.
+
+<ParamField body="MEETCOST_LOADING_FACTOR" type="decimal" default="1.30">
+  Fully-loaded cost multiplier. The hourly cost of a participant is `(annual_pay / working_hours_per_year) × loading_factor`. A factor of `1.30` means total employment cost is assumed to be 30% higher than base salary (covering benefits, tax, overhead). Adjust to match your organisation's actual burden rate.
+</ParamField>
+
+<ParamField body="MEETCOST_WORKING_HOURS_PER_YEAR" type="integer" default="2080">
+  The number of working hours per year used to convert annual salaries to hourly rates. The standard 40-hour week × 52 weeks equals 2080. Adjust if your organisation uses a different standard (e.g. 1800 for 37.5-hour weeks in some European contexts).
+</ParamField>
+
+<ParamField body="MEETCOST_FALLBACK_ANNUAL_PAY" type="decimal" default="0">
+  Organisation-wide annual pay figure (in `MEETCOST_BASE_CURRENCY`) applied to any participant who does not have a pay record. The default of `0` means uncovered people cost nothing, which silently understates every estimate. MeetCost shows a warning on screen when this is zero, but **you should set a real blended figure before going live with real data**.
+</ParamField>
+
+<ParamField body="MEETCOST_BASE_CURRENCY" type="string" default="USD">
+  ISO 4217 currency code for the organisation's base currency. All pay figures are stored and displayed in this currency. Automatically uppercased.
+</ParamField>
+
+---
+
+## Policy
+
+These values also seed the `org_config` table and can be changed at runtime by an admin. See `docs/PERMISSIONS.md` before changing disclosure settings.
+
+<ParamField body="MEETCOST_PER_PERSON_BREAKDOWN_ENABLED" type="boolean" default="false">
+  When `true`, allows authorised users to see the cost broken down per individual participant rather than just the total. Disabled by default — enabling this exposes implied salary information to anyone with access to the breakdown.
+</ParamField>
+
+<ParamField body="MEETCOST_SMALL_MEETING_THRESHOLD" type="integer" default="5">
+  Meetings with fewer attendees than this threshold are considered "small" and may be subject to different disclosure rules (see `MEETCOST_PER_PERSON_BREAKDOWN_ENABLED`). Set to `0` to disable the small meeting distinction.
+</ParamField>
+
+<ParamField body="MEETCOST_PARTICIPANTS_SEE_COST" type="boolean" default="false">
+  When `true`, meeting participants can see the cost of meetings they attended. When `false` (the default), cost figures are visible only to organisers and users with a role of `team_lead`, `finance`, or `admin`.
+</ParamField>
+
+<ParamField body="MEETCOST_NUDGE_COST_THRESHOLD" type="decimal" default="500">
+  If the estimated cost of a meeting exceeds this value (in `MEETCOST_BASE_CURRENCY`), a nudge is shown to the organiser at scheduling time. Set to `0` to disable cost-based nudges.
+</ParamField>
+
+<ParamField body="MEETCOST_NUDGE_HEADCOUNT_THRESHOLD" type="integer" default="8">
+  If the number of invited attendees exceeds this value, a nudge is shown to the organiser. Set to `0` to disable headcount-based nudges.
+</ParamField>
+
+<ParamField body="MEETCOST_NUDGE_DURATION_MINUTES_THRESHOLD" type="integer" default="60">
+  If the scheduled duration (in minutes) exceeds this value, a nudge is shown to the organiser. Set to `0` to disable duration-based nudges.
+</ParamField>
+
+---
+
+## Integrations
+
+### Google Workspace
+
+<ParamField body="MEETCOST_GOOGLE_DIRECTORY_CUSTOMER_ID" type="string" default="None">
+  Google Workspace customer ID for directory sync (typically starts with `C`). When set, the `sync-directory` command will pull employees from the Google Directory API. Requires `MEETCOST_GOOGLE_SERVICE_ACCOUNT_FILE` and `MEETCOST_GOOGLE_ADMIN_SUBJECT`.
+</ParamField>
+
+<ParamField body="MEETCOST_GOOGLE_SERVICE_ACCOUNT_FILE" type="string" default="None">
+  Path to a Google service account JSON key file with domain-wide delegation enabled. Required for directory sync and Google Meet attendance collection.
+</ParamField>
+
+<ParamField body="MEETCOST_GOOGLE_ADMIN_SUBJECT" type="string" default="None">
+  Email address of the Google Workspace admin user that the service account impersonates via domain-wide delegation. The service account acts as this user when calling the Admin SDK and Reports API.
+</ParamField>
+
+### Microsoft 365
+
+<ParamField body="MEETCOST_MICROSOFT_TENANT_ID" type="string" default="None">
+  Microsoft Entra tenant ID (a UUID). Required for Microsoft Teams attendance via webhooks and for Microsoft directory sync.
+</ParamField>
+
+<ParamField body="MEETCOST_MICROSOFT_CLIENT_ID" type="string" default="None">
+  Application (client) ID of the Entra app registration used to call Microsoft Graph.
+</ParamField>
+
+<ParamField body="MEETCOST_MICROSOFT_CLIENT_SECRET" type="string" default="None">
+  Client secret for the Entra app registration. Store this in your secret manager and inject at runtime — never commit it to source control.
+</ParamField>
+
+### Zoom
+
+<ParamField body="MEETCOST_ZOOM_ACCOUNT_ID" type="string" default="None">
+  Zoom account ID, used for Server-to-Server OAuth. Required for Zoom attendance.
+</ParamField>
+
+<ParamField body="MEETCOST_ZOOM_CLIENT_ID" type="string" default="None">
+  Client ID of the Zoom Server-to-Server OAuth app.
+</ParamField>
+
+<ParamField body="MEETCOST_ZOOM_CLIENT_SECRET" type="string" default="None">
+  Client secret of the Zoom Server-to-Server OAuth app. Store in your secret manager.
+</ParamField>
+
+<ParamField body="MEETCOST_ZOOM_WEBHOOK_SECRET" type="string" default="None">
+  Secret token used to verify the `v0` HMAC signature on incoming Zoom webhook events at `POST /webhooks/zoom`. Required if you use Zoom webhooks.
+</ParamField>
+
+### HRIS
+
+<ParamField body="MEETCOST_HRIS_ADAPTER" type="string" default="None">
+  The HRIS adapter to use for pay data sync. Identifies which integration module to load. Leave empty if you manage pay data via CSV import (`meetcost import-pay`) rather than a live HRIS connection.
+</ParamField>
+
+<ParamField body="MEETCOST_HRIS_BASE_URL" type="string" default="None">
+  Base URL of the HRIS API. This host is automatically added to the egress allowlist when set.
+</ParamField>
+
+<ParamField body="MEETCOST_HRIS_API_KEY" type="string" default="None">
+  API key for the HRIS integration. Store in your secret manager.
+</ParamField>
+
+---
+
+## Notifications
+
+<ParamField body="MEETCOST_SMTP_HOST" type="string" default="None">
+  SMTP server hostname for sending digest emails. When unset, digest emails are not sent. This host is automatically added to the egress allowlist when set.
+</ParamField>
+
+<ParamField body="MEETCOST_SMTP_PORT" type="integer" default="587">
+  SMTP server port. `587` is the standard submission port (STARTTLS). Use `465` for implicit TLS (SMTPS).
+</ParamField>
+
+<ParamField body="MEETCOST_SMTP_USERNAME" type="string" default="None">
+  SMTP authentication username. Leave unset if your relay does not require authentication (e.g. an internal relay on a trusted network).
+</ParamField>
+
+<ParamField body="MEETCOST_SMTP_PASSWORD" type="string" default="None">
+  SMTP authentication password. Store in your secret manager.
+</ParamField>
+
+<ParamField body="MEETCOST_SMTP_FROM" type="string" default="None">
+  The `From` address for digest emails, e.g. `meetcost@your-company.example`.
+</ParamField>
+
+<ParamField body="MEETCOST_SMTP_STARTTLS" type="boolean" default="true">
+  Whether to use STARTTLS when connecting to the SMTP server. Disable only if your relay does not support STARTTLS (e.g. some internal relays). Not relevant when using port 465 with implicit TLS.
+</ParamField>
+
+<ParamField body="MEETCOST_CHAT_WEBHOOK_URL" type="string" default="None">
+  Incoming webhook URL for posting digest summaries to a chat platform (Slack, Microsoft Teams, Google Chat). The host of this URL is automatically added to the egress allowlist when set.
+</ParamField>
+
+---
+
+## Egress
+
+MeetCost derives an egress allowlist automatically from your configuration: the hostnames implied by `MEETCOST_DATABASE_URL`, `MEETCOST_OIDC_ISSUER`, `MEETCOST_SMTP_HOST`, `MEETCOST_HRIS_BASE_URL`, `MEETCOST_CHAT_WEBHOOK_URL`, and the provider API hosts implied by your integration credentials are all included automatically. You only need these variables for hosts not covered by other settings.
+
+<ParamField body="MEETCOST_ALLOWED_EGRESS_HOSTS" type="string" default="">
+  Comma-separated list of additional hostnames the service is permitted to connect to. Use this for HTTP proxies, internal DNS names, or any other host not implied by the other configuration values.
+
+  ```bash
+  MEETCOST_ALLOWED_EGRESS_HOSTS=squid-proxy.internal.example,custom-api.internal.example
+  ```
+
+  If you are running on Kubernetes with a `NetworkPolicy`, add the same hosts to `networkPolicy.extraEgress` or requests will be blocked by the cluster even if the application allows them.
+</ParamField>
+
+<ParamField body="MEETCOST_ENFORCE_EGRESS_ALLOWLIST" type="boolean" default="true">
+  When `true`, the service refuses to open outbound connections to any host not on the egress allowlist. This is the default and the correct setting for production. Set to `false` only temporarily for debugging. CI asserts this is `true` in the shipped defaults.
+</ParamField>
+
+---
+
+## CORS
+
+<ParamField body="MEETCOST_ALLOWED_CLIENT_ORIGINS" type="string" default="">
+  Comma-separated list of browser origins permitted to call the API. Required if the admin console or calendar add-in iframes are served from a different origin than `MEETCOST_PUBLIC_BASE_URL`.
+
+  ```bash
+  MEETCOST_ALLOWED_CLIENT_ORIGINS=https://admin.your-company.example,https://meet.google.com
+  ```
+
+  If you set `MEETCOST_SERVE_CLIENTS_PATH`, the browser add-ins are served from the same origin as the API and no CORS configuration is needed.
+</ParamField>
+
+---
+
+## Two-zone configuration summary
+
+| Zone | Where it lives | How to change |
+|---|---|---|
+| Deployment settings (database, keys, egress, auth) | Environment variables | Restart required |
+| Rate and policy defaults (thresholds, currency, disclosure) | `org_config` table (seeded from env) | Admin UI or database update — no restart needed |
+
+The split means you can tune meeting cost policy without coordinating a deployment. The deployment boundary stays with the things that genuinely require operator-level access.

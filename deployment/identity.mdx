@@ -1,0 +1,193 @@
+---
+title: "Identity and Authentication Setup for MeetCost"
+sidebarTitle: "Identity"
+description: "Configure OIDC token verification for Google Workspace, Microsoft 365, Okta, and Keycloak. Set up machine service tokens and scheduled job credentials."
+---
+
+MeetCost has no user accounts of its own. It verifies bearer tokens that your identity provider already issues — the same Google, Microsoft, Okta, or Keycloak tenant your calendar and email run on. When a user opens the admin console or a calendar add-in calls the API, it presents a token it obtained from your IdP. MeetCost validates the token's signature against the IdP's JWKS, checks the audience, and extracts the user's email from the configured claim. No passwords are stored, no sessions are issued by MeetCost itself, and there is nothing for users to register.
+
+## How OIDC verification works
+
+Set `MEETCOST_AUTH_MODE=oidc` and provide `MEETCOST_OIDC_ISSUER`. MeetCost fetches the OIDC discovery document from `<issuer>/.well-known/openid-configuration` at startup and reads the JWKS endpoint from it. All token verification is local after that — no call to the IdP is made per-request.
+
+<Note>
+  `MEETCOST_AUTH_MODE=dev` accepts locally-signed tokens for local development. It is refused when `MEETCOST_ENVIRONMENT=production`. Never configure `dev` mode for a deployment that handles real pay data.
+</Note>
+
+## Identity provider configuration
+
+| Platform | `MEETCOST_OIDC_ISSUER` | Notes |
+|---|---|---|
+| Google Workspace | `https://accounts.google.com` | The Meet add-on's `ScriptApp.getIdentityToken()` works directly. Set `MEETCOST_OIDC_AUDIENCE` to your OAuth client ID. |
+| Microsoft 365 | `https://login.microsoftonline.com/<tenant-id>/v2.0` | Replace `<tenant-id>` with your Entra directory (tenant) ID. Set `MEETCOST_OIDC_AUDIENCE` to your application (client) ID. |
+| Okta | `https://<your-domain>.okta.com` | Discovery is used automatically. Set `MEETCOST_OIDC_AUDIENCE` to your Okta application client ID. |
+| Keycloak | `https://<keycloak-host>/realms/<realm>` | Discovery is used automatically. Set `MEETCOST_OIDC_AUDIENCE` to your Keycloak client ID. |
+
+<Tabs>
+  <Tab title="Google Workspace">
+    ```bash
+    MEETCOST_AUTH_MODE=oidc
+    MEETCOST_OIDC_ISSUER=https://accounts.google.com
+    MEETCOST_OIDC_AUDIENCE=123456789-abc.apps.googleusercontent.com
+    ```
+
+    Google tokens include the user's email in the `email` claim by default — no need to set `MEETCOST_OIDC_EMAIL_CLAIM`.
+
+    The Meet add-on's `ScriptApp.getIdentityToken()` produces a Google-signed JWT that MeetCost can verify directly, without any additional OAuth flow in the add-on.
+  </Tab>
+  <Tab title="Microsoft 365">
+    ```bash
+    MEETCOST_AUTH_MODE=oidc
+    MEETCOST_OIDC_ISSUER=https://login.microsoftonline.com/your-tenant-id/v2.0
+    MEETCOST_OIDC_AUDIENCE=your-entra-app-client-id
+    ```
+
+    Microsoft tokens include the user's email in the `email` claim when the `email` scope is requested. If your app uses `preferred_username` instead, set:
+
+    ```bash
+    MEETCOST_OIDC_EMAIL_CLAIM=preferred_username
+    ```
+  </Tab>
+  <Tab title="Okta">
+    ```bash
+    MEETCOST_AUTH_MODE=oidc
+    MEETCOST_OIDC_ISSUER=https://your-domain.okta.com
+    MEETCOST_OIDC_AUDIENCE=your-okta-client-id
+    ```
+
+    If your Okta authorization server is a custom one (not the org server), use its specific issuer URL, e.g. `https://your-domain.okta.com/oauth2/aus1abc123`.
+  </Tab>
+  <Tab title="Keycloak">
+    ```bash
+    MEETCOST_AUTH_MODE=oidc
+    MEETCOST_OIDC_ISSUER=https://keycloak.your-company.example/realms/your-realm
+    MEETCOST_OIDC_AUDIENCE=meetcost
+    ```
+
+    Keycloak uses the `email` claim by default. If email is not included in your realm's token mapping, add an "email" mapper to your client's scopes.
+  </Tab>
+</Tabs>
+
+## Non-standard email claims
+
+MeetCost reads the user's email from the `email` JWT claim by default. If your identity provider uses a different claim name, set:
+
+```bash
+MEETCOST_OIDC_EMAIL_CLAIM=your_custom_claim
+```
+
+Common alternatives:
+
+| Scenario | Claim to use |
+|---|---|
+| Microsoft 365 without the `email` scope | `preferred_username` |
+| Azure AD B2C custom policies | `emails` (returns an array — first value is used) |
+| Legacy enterprise SAML-to-OIDC bridges | Check your IdP's documentation for the claim name |
+
+## Admin console and SSO proxy integration
+
+The admin console stores the caller's token in `sessionStorage` for the tab's lifetime. The recommended production posture is to place MeetCost behind the SSO proxy you already operate:
+
+<CardGroup cols={3}>
+  <Card title="oauth2-proxy" icon="shield-halved">
+    Configure oauth2-proxy to validate tokens and pass them upstream as `Authorization: Bearer <token>` or `X-Forwarded-Access-Token`. MeetCost reads from `Authorization` by default.
+  </Card>
+  <Card title="Pomerium" icon="lock">
+    Pomerium can inject identity headers at the proxy layer. Configure the `pass_identity_headers` policy to forward the JWT to MeetCost.
+  </Card>
+  <Card title="Cloudflare Access" icon="cloud">
+    Cloudflare Access issues its own signed JWT in the `Cf-Access-Jwt-Assertion` header. Configure `MEETCOST_OIDC_ISSUER` to your Access team domain and set `MEETCOST_OIDC_AUDIENCE` to your Access application AUD tag.
+  </Card>
+</CardGroup>
+
+The SSO proxy approach means your ingress enforces authentication before any request reaches MeetCost's application layer. Users who are not in your IdP cannot reach the service at all.
+
+## Machine callers: service tokens
+
+Cron jobs, webhook relays, and other automated systems that call the API use static service tokens rather than OIDC tokens. Configure them with:
+
+```bash
+MEETCOST_SERVICE_TOKENS=digest-cron:$(openssl rand -hex 32),collector:$(openssl rand -hex 32)
+```
+
+The format is `name:token` pairs, comma-separated. The name is for your reference only (it appears in audit log entries). Callers pass the token as a standard bearer token:
+
+```bash
+curl -H "Authorization: Bearer <token>" https://meetcost.your-company.example/api/...
+```
+
+<Warning>
+  Service tokens carry admin-level rights. Treat them with the same care as admin credentials. Rotate them on the same schedule as your other privileged secrets. If a token is compromised, remove it from `MEETCOST_SERVICE_TOKENS` and restart the service — the old token is immediately invalidated.
+</Warning>
+
+Tokens are matched in constant time to prevent timing attacks.
+
+## Bootstrap admins
+
+On first boot, before any role rows exist in the database, MeetCost needs at least one admin. Use `MEETCOST_BOOTSTRAP_ADMINS` to pre-grant the admin role to one or more email addresses:
+
+```bash
+MEETCOST_BOOTSTRAP_ADMINS=alice@your-company.example,bob@your-company.example
+```
+
+These emails are granted the `admin` role each time the service starts. Once you have a working admin user who can manage roles through the UI or CLI, this variable's effect is idempotent — setting it to a real admin's email is harmless to leave in place.
+
+<Tip>
+  On Kubernetes, pass this via `--set config.bootstrapAdmins=alice@your-company.example` in the `helm install` command. You can remove it or leave it as-is after the first login.
+</Tip>
+
+## Development tokens
+
+In development mode (`MEETCOST_ENVIRONMENT=development`, `MEETCOST_AUTH_MODE=dev`), the CLI can mint locally-signed tokens for any email address:
+
+```bash
+meetcost token alice@example.com
+```
+
+This prints a JWT to stdout that can be used as a bearer token against the local service. It is useful for testing API calls and the admin console without an identity provider configured.
+
+```bash
+TOKEN=$(meetcost token alice@example.com)
+curl -H "Authorization: Bearer $TOKEN" http://localhost:8000/api/meetings
+```
+
+<Warning>
+  `meetcost token` is refused when `MEETCOST_ENVIRONMENT=production`. It exists only for local development. Never use development tokens against a production deployment.
+</Warning>
+
+## Role management
+
+MeetCost has five roles:
+
+| Role | Description |
+|---|---|
+| `participant` | Can view cost estimates for meetings they attended (if `MEETCOST_PARTICIPANTS_SEE_COST=true`) |
+| `organiser` | Can view cost estimates for meetings they organised |
+| `team_lead` | Can view cost estimates for meetings involving their team |
+| `finance` | Can view all meeting costs and pay data across the organisation |
+| `admin` | Full access, including configuration, user management, and all data |
+
+Assign roles with the `meetcost grant` CLI command:
+
+```bash
+meetcost grant alice@your-company.example admin
+meetcost grant bob@your-company.example finance
+meetcost grant carol@your-company.example team_lead --team-id engineering
+```
+
+The `--team-id` flag is used with the `team_lead` role to scope access to a specific team. Without it, a `team_lead` has no team-scoped access.
+
+You can also manage roles through the admin console UI once at least one admin is logged in.
+
+## Authentication flow summary
+
+```
+User/machine → presents Bearer token → MeetCost validates:
+  1. Signature against IdP JWKS (cached at startup)
+  2. `aud` claim matches MEETCOST_OIDC_AUDIENCE (or matches a service token name:value pair)
+  3. `exp` claim has not passed
+  4. Email extracted from MEETCOST_OIDC_EMAIL_CLAIM
+  5. Email looked up in role table → effective permissions applied
+```
+
+There is no session issued by MeetCost. Each request is authenticated independently against the presented token.

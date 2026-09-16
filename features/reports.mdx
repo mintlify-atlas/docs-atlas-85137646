@@ -1,0 +1,137 @@
+---
+title: "Weekly and Monthly Meeting Cost Reports"
+sidebarTitle: "Reports"
+description: "MeetCost generates periodic cost reports scoped automatically to the caller's role — org-wide for admins, team-level for leads, and per-organiser for others. CSV export included."
+---
+
+Every MeetCost report is built inside the caller's permission scope — the server decides what you can see from your role, and no request parameter can widen it. An organiser requesting a report sees only their own meetings. A team lead sees their team. A finance user or admin sees the whole organisation. This is not a matter of defaulting to a safe filter that a determined client could bypass; the scope is derived server-side and is the only scope that query ever runs against.
+
+## Role-to-scope mapping
+
+| Role | Report scope |
+|---|---|
+| Participant | `403 Forbidden` |
+| Organiser | Own meetings only |
+| Team Lead | Own team's meetings |
+| Finance | Org-wide |
+| Admin | Org-wide |
+
+There is no `?scope=` parameter. A client that cannot see org-wide data cannot ask for it.
+
+## Requesting a report
+
+```bash
+GET /api/v1/reports?period=weekly|monthly
+```
+
+Returns the most recent complete period. For `weekly`, that is the last complete Monday-to-Monday window. For `monthly`, it is the previous calendar month.
+
+To request a historical period, pass an `anchor` date. The report covers the complete period immediately before that date:
+
+```bash
+GET /api/v1/reports?period=monthly&anchor=2026-09-01
+```
+
+Both the JSON report endpoint and the CSV export endpoint are **audited** — every access writes to the audit log.
+
+### Report contents
+
+<CardGroup cols={2}>
+  <Card title="Total spend" icon="circle-dollar-to-slot">
+    Aggregate payroll cost of all meetings in scope for the period, plus meeting count, total person-hours, and percentage change against the previous period.
+  </Card>
+  <Card title="Spend by recurring series" icon="arrows-rotate">
+    Total and occurrence count per series, plus an **annual run-rate** derived from the average per-occurrence cost multiplied by the series cadence's occurrences-per-year.
+  </Card>
+  <Card title="Largest single meetings" icon="arrow-up-wide-short">
+    The top 10 most expensive individual meetings in the period, by actual cost.
+  </Card>
+  <Card title="Spend by team" icon="sitemap">
+    Cost breakdown by the organiser's team, sorted by total spend descending. Present only where team data is available in the directory.
+  </Card>
+</CardGroup>
+
+The `change_percent` field is the percentage change in `total_spend` versus the previous equivalent period — positive is an increase, negative a decrease.
+
+### The `reduced_before_send` metric
+
+For org-wide scopes (Finance and Admin), the report includes a `reduced_before_send` object derived from the `draft_id` snapshot table:
+
+```json
+"reduced_before_send": {
+  "drafts": 142,
+  "reduced": 31,
+  "abandoned": 18,
+  "saved_estimate": "4821.50",
+  "currency": "USD",
+  "reduced_percent": 21.8
+}
+```
+
+This answers: of the draft meetings that went through cost estimation, how many were trimmed or cancelled before the invite was sent? `reduced_percent` is `reduced / drafts × 100`. This metric is only meaningful at org-wide scope and is absent from team-level and individual reports.
+
+## CSV export
+
+```bash
+GET /api/v1/reports/export.csv?period=weekly|monthly
+GET /api/v1/reports/export.csv?period=monthly&anchor=2026-09-01
+```
+
+The CSV contains the same data as the JSON report, formatted as a series of sections. No column in the export identifies an individual's cost — the export cannot become a salary spreadsheet by accident.
+
+The CSV sections are:
+
+1. **Report metadata** — period, scope, currency, total spend, meeting count, person-hours, previous total, change percent
+2. **Spend by team** — `team_id`, `team_name`, `meetings`, `total`
+3. **Spend by recurring series** — `series_id`, `title`, `occurrences`, `total`, `annualised_run_rate`
+4. **Largest single meetings** — `meeting_id`, `title`, `started_at`, `headcount`, `duration_minutes`, `total`
+
+<Warning>
+The CSV export is subject to the same role-scope restrictions as the JSON endpoint. An organiser's export contains only their own meetings; a participant requesting the export receives `403`.
+</Warning>
+
+## Periodic digests
+
+Digests deliver the report to inboxes and chat webhooks on a schedule, so the people who need the data do not have to remember to go and fetch it.
+
+Each digest is scoped to the recipient's own role — a team lead's weekly email contains their team and nothing else. Digests are only sent to users who hold the `team_lead`, `finance`, or `admin` role.
+
+### Scheduling with cron
+
+Digests are not driven by an in-process timer. Run them from your scheduler:
+
+```bash
+# Weekly digest (runs after the previous week closes — Monday morning works well)
+meetcost digest --period weekly
+
+# Monthly digest (runs after the previous month closes — first of the month)
+meetcost digest --period monthly
+```
+
+As a Kubernetes CronJob:
+
+```yaml
+# Weekly, Monday 07:00 UTC
+- schedule: "0 7 * * 1"
+  args: ["digest", "--period", "weekly"]
+
+# Monthly, 1st of month 07:00 UTC
+- schedule: "0 7 1 * *"
+  args: ["digest", "--period", "monthly"]
+```
+
+### Idempotency via `digest_runs`
+
+Every successful dispatch writes a row to the `digest_runs` table keyed on `(period, period_start, audience)`. If the job runs twice for the same period and recipient — due to a retry, a cronjob overlap, or a manual re-run — the second execution skips the send rather than delivering a duplicate.
+
+To force a resend (for example, after fixing a template):
+
+```bash
+meetcost digest --period weekly --force
+```
+
+`--force` updates the existing `digest_runs` row rather than inserting a second one, so the uniqueness guarantee is preserved.
+
+<Note>
+If a recipient has no meetings in scope for the period, no digest is sent to them — an empty report email adds noise without value. The job logs this as a skip, not an error.
+</Note>

@@ -1,0 +1,206 @@
+---
+title: "MeetCost Architecture and Code Layout"
+sidebarTitle: "Architecture"
+description: "Understand MeetCost's layered architecture: engine, service, HTTP, and infrastructure layers, plus the storage schema, request paths, and deliberate design absences."
+---
+
+MeetCost is a single self-hosted Python service backed by Postgres, with three thin browser clients that carry no payroll data. The code is organised in four layers with a strict one-way dependency direction: HTTP depends on service, service depends on engine, and nothing in the engine knows about HTTP, the database, or the clock. This means every number the product displays can be traced to a single module — `rates.py` — without following a call graph through the rest of the codebase.
+
+## System overview
+
+```
+[Meet Add-on]  [Zoom App]  [Teams App]
+        \          |          /
+         \         |         /
+       HTTPS (org-controlled domain)
+                   |
+        ┌──────────────────────┐
+        │  MeetCost Service    │  ← self-hosted (Docker / Helm)
+        │  - Rate engine       │
+        │  - Directory sync    │
+        │  - Report store      │
+        └──────────────────────┘
+                   |
+             [Postgres]  ← encrypted at rest, org-owned
+```
+
+The three clients communicate exclusively with the operator-configured backend URL. There is no vendor-operated relay, no telemetry endpoint, and no analytics SDK. The egress allowlist (see [below](#boot-sequence)) is enforced in code before any socket can open, and its enforcement is asserted by a test in CI.
+
+## The four-layer architecture
+
+The dependency direction is one-way: HTTP → service → engine. Nothing in the engine knows about HTTP, the database, or the clock.
+
+| Layer | Modules | Knows about |
+|---|---|---|
+| **Engine** | `rates.py`, `permissions.py` | Arithmetic and policy. Pure functions over dataclasses. No I/O, no clock, no session |
+| **Service** | `service.py`, `payroll.py`, `reports.py`, `digests.py`, `sync.py` | The database, the org's configuration, and time |
+| **HTTP** | `api/*.py`, `admin_ui.py` | Requests, responses, and status codes |
+| **Infrastructure** | `db.py`, `crypto.py`, `egress.py`, `auth.py`, `notify.py` | Everything the layers above depend on |
+
+### The engine layer
+
+`rates.py` is the module to read first. Every number MeetCost displays is produced there, so an auditor asking "where did USD 649 come from?" has one file to read rather than a call graph to trace.
+
+The core formula is:
+
+```
+cost_per_minute(person) = (annual_pay × loading_factor) / (working_hours_per_year × 60)
+meeting_cost            = sum over participants of (cost_per_minute × minutes_attended)
+```
+
+Two documented departures from this formula:
+
+- **Hourly staff** (`pay_basis="hourly"`) use the stated hourly rate directly, divided by 60 to get a per-minute figure. Annualising an hourly worker's pay and dividing it back down reintroduces the 2,080-hour assumption that makes the number wrong for them.
+- **Currency** is carried through and never converted. A meeting whose participants hold records in different currencies raises `MixedCurrencyError` rather than silently summing with a hidden exchange-rate assumption.
+
+`permissions.py` sits alongside `rates.py` in the engine layer. It applies redaction rules — per-person breakdown suppression, small-meeting rounding — before a result leaves the engine. The banding function rounds totals to two significant figures for non-admin viewers of small meetings, so a precise total cannot itself be a salary disclosure.
+
+## Request paths
+
+### Scheduling estimate (§6.3)
+
+One round trip, two queries. This path is called on every edit to the invitee list, so it is designed to fan out to nothing:
+
+```
+client → POST /api/v1/estimate
+           → directory + pay-record lookup for the invitees
+           → rates.estimate_meeting_cost()
+           → permissions.redact() for this caller
+           → EstimateSnapshot written (if the client passed a draft_id)
+         ← redacted total, annualised figure, nudges
+```
+
+No per-participant queries, no external calls. The estimate assumes every invitee attends for the full slot; post-meeting actuals (§6.4) replace this with real attendance.
+
+### Post-meeting summary (§6.4)
+
+The provider tells MeetCost a meeting ended; MeetCost goes and reads what happened from the org's own tenant:
+
+```
+provider webhook → signature verified → meeting id extracted
+                 → background: adapter reads attendance from the org's own tenant
+                 → rates.meeting_cost() over actual attended minutes
+                 → stored, then one email per recipient, each redacted separately
+```
+
+<Note>
+  The webhook body supplies **only** the meeting ID. Attendance comes from an authenticated read against the org's own directory or calendar tenant. A forged webhook cannot inject a fabricated cost — it can only trigger a lookup that will either find a real meeting or return nothing.
+</Note>
+
+## Storage schema
+
+Money columns are `Numeric(18, 4)` — exact on Postgres, float-backed on SQLite, which is one reason SQLite is documented as development-only.
+
+| Table | Holds | Notes |
+|---|---|---|
+| `org_config` | One row. Rate parameters and disclosure policy | Seeded from env at first boot, authoritative after |
+| `pay_records` | Pay, encrypted | Versioned by `effective_date`; never updated in place |
+| `people` | Directory | Read-only mirror of the org's own directory |
+| `user_roles` | Role assignments | Absence of a row means `participant` |
+| `meetings`, `meeting_participants` | Costed meetings | Both the estimate and the actual, so §6.4 can compare |
+| `estimate_snapshots` | Every estimate served for a draft | Makes "reduced before send" measurable |
+| `audit_events` | Who read or exported pay data | Append-only by convention; no API deletes from it |
+| `digest_runs` | Digests sent | Makes the scheduled job idempotent |
+
+`pay_records` is versioned by `effective_date`: rather than updating a row in place, each pay change inserts a new row. The rate engine picks the latest record whose `effective_date` is on or before the meeting date. This means historical cost calculations remain accurate as pay changes over time.
+
+## Configuration zones
+
+Configuration lives in two places deliberately, because the people who change deployment settings and the people who change policy settings are different people.
+
+### Deployment settings — environment variables
+
+Database URL, encryption key, egress allowlist, OIDC issuer, and SMTP credentials are all environment variables read once at boot. Changing any of them is a deploy.
+
+```ini
+# Core
+MEETCOST_DATABASE_URL=postgresql+psycopg://...
+MEETCOST_ENCRYPTION_KEY=<base64-encoded 32-byte key>
+MEETCOST_SECRET_KEY=<random string>
+MEETCOST_PUBLIC_BASE_URL=https://meetcost.your-org.internal
+
+# Auth
+MEETCOST_AUTH_MODE=oidc
+MEETCOST_OIDC_ISSUER=https://your-idp.example.com
+MEETCOST_OIDC_AUDIENCE=meetcost
+
+# Rate engine seed values
+MEETCOST_LOADING_FACTOR=1.30
+MEETCOST_WORKING_HOURS_PER_YEAR=2080
+MEETCOST_BASE_CURRENCY=USD
+
+# Egress
+MEETCOST_ENFORCE_EGRESS_ALLOWLIST=true
+```
+
+### Policy settings — `org_config` table
+
+Loading factor, nudge thresholds, disclosure policy, and the small-meeting threshold are seeded from environment variables at first boot and then live in the `org_config` table. A finance lead can change the loading factor from 1.30 to 1.35 by clicking in the admin UI — no platform engineer required. Each change is audited with a before-and-after value.
+
+```
+env (seed) → org_config (authoritative)
+                ↑
+           admin UI (audited changes)
+```
+
+## Boot sequence
+
+The startup order in `main.py` is deliberate:
+
+```
+validate_deployment()   →  refuse to start if production config is unsafe
+install_guard()         →  egress allowlist active before any socket can open
+init_db()               →  create tables, seed org_config
+```
+
+The guard is installed before anything else runs, so there is no window in which an outbound connection could slip out unchecked — not during database initialisation, not during OIDC key fetch, not anywhere.
+
+`validate_deployment` raises (rather than warns) in production for any of:
+
+- `MEETCOST_ENCRYPTION_KEY` is not set
+- `MEETCOST_AUTH_MODE=dev` (dev auth mode in production)
+- `MEETCOST_SECRET_KEY` is still the default value `change-me-in-production`
+- `MEETCOST_ENFORCE_EGRESS_ALLOWLIST=false`
+- `MEETCOST_AUTH_MODE=oidc` with no `MEETCOST_OIDC_ISSUER`
+
+A MeetCost that boots without its data-residency guarantees is worse than one that does not boot, because the guarantee is the product.
+
+## The egress guard
+
+`egress.py` wraps `socket.getaddrinfo` and `socket.socket.connect` at the process level. A hostname is checked at resolution time, where the name is still available; the resulting IP addresses are remembered so a subsequent connect to a bare IP can be matched back to the hostname that produced it.
+
+The allowlist is derived entirely from operator configuration — there is no hardcoded hostname anywhere in `egress.py`. Hosts appear in the allowlist only because an operator configured a URL that resolves to them: the database host, the OIDC issuer, the SMTP host, and any explicitly listed `MEETCOST_ALLOWED_EGRESS_HOSTS`. If a directory sync adapter attempts to reach a host that is not in the list, `EgressBlocked` is raised and surfaces as a `502` with a clear message.
+
+## Code layout reference
+
+| Path | What |
+|---|---|
+| `server/meetcost/rates.py` | The rate engine. Pure functions, no I/O — read this first |
+| `server/meetcost/permissions.py` | Who may see what, and the salary-inference protections |
+| `server/meetcost/egress.py` | The outbound allowlist that makes the residency claim real |
+| `server/meetcost/adapters/` | Directory, attendance, and HRIS providers |
+| `server/tests/test_no_egress.py` | The test that keeps the privacy claim honest |
+| `clients/` | The three add-ins, each its own package |
+| `deploy/helm/meetcost` | Helm chart for Kubernetes deployments |
+
+## Extension points
+
+Three protocols in `adapters/base.py` define the adapter interface, documented fully in [Adapters](/integrations/adapters):
+
+- **`DirectoryProvider`** — read people from the org's own tenant (Google Workspace, Microsoft Entra ID)
+- **`AttendanceCollector`** — read who actually attended a completed meeting
+- **`HRISProvider`** — read pay data from an HR system (BambooHR example ships in `adapters/hris_bamboohr.py`)
+
+All three are read-only against the org's own systems, and all are subject to the egress guard regardless of what they attempt. A new adapter that tries to call an unconfigured host will be blocked at the socket level.
+
+## What is deliberately absent
+
+These are not gaps — they are conscious choices with documented rationale.
+
+**No in-process background scheduler.** Digest delivery and attendance polling are triggered by the org's own scheduler (cron, Kubernetes CronJob, etc.). A thread that dies silently at 3am produces a report nobody notices is missing. External scheduling makes failures visible.
+
+**No caching layer.** Scheduling estimates are two indexed queries. Adding Redis would add a place where decrypted pay data could rest outside the encrypted database — the very thing the architecture is designed to prevent.
+
+**No message queue.** Webhook handling uses FastAPI background tasks. The ingest endpoint is idempotent on `(provider, provider_meeting_id)`, so if a deployment outgrows background tasks, a queue can be put in front without any application changes.
+
+**No frontend build toolchain.** The admin UI is server-rendered HTML with vanilla JavaScript. The browser clients are plain files. There is nothing here that warrants a Node.js build pipeline.

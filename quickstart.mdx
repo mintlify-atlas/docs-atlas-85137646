@@ -1,47 +1,270 @@
 ---
-title: "Quickstart"
-description: "Begin with a guide on the fastest path to a successful outcome"
+title: "Get Started with MeetCost in Under 15 Minutes"
+sidebarTitle: "Quickstart"
+description: "Run MeetCost locally with Docker or Python, seed demo data, and get a live meeting cost estimate from the API in under 15 minutes."
 ---
 
-Describe how someone begins using your product. What is the first thing they need to do? Are there any prerequisites?
+This guide takes you from a fresh clone to a working local deployment with real cost figures on screen — seeded with eight fictional employees and a handful of completed meetings so the reports have something in them from the first load. There are two paths: Docker (fewest prerequisites) and plain Python with a virtual environment. Pick the one that matches your setup; both land at the same place.
 
-A quickstart should take someone from zero to using your product. They'll get a quick win and a sense of what they can accomplish.
+<Note>
+  The local quickstart uses `MEETCOST_ENVIRONMENT=development` and `MEETCOST_AUTH_MODE=dev`, which enables the `meetcost token` command and relaxes some production checks. These modes are explicitly refused when `MEETCOST_ENVIRONMENT=production`. See [Deployment](/deployment) for the production setup with Postgres and OIDC.
+</Note>
 
 ## Prerequisites
 
-Before you begin, you must have:
+<Tabs>
+  <Tab title="Docker">
+    - [Docker Desktop](https://www.docker.com/products/docker-desktop/) or Docker Engine with Compose v2
+    - Git
+    - `jq` (optional, for pretty-printing the API response)
+  </Tab>
+  <Tab title="Without Docker">
+    - Python 3.9 or later
+    - Git
+    - `jq` (optional, for pretty-printing the API response)
+  </Tab>
+</Tabs>
 
-- Requirement one (for example, Node.js 18+, a free account, an API key)
-- Requirement two (for example, a compatible device, a compatible browser, a compatible operating system)
+## Setup
 
-## Get started
+<Tabs>
+  <Tab title="With Docker">
+    <Steps>
+      <Step title="Clone the repository">
+        ```bash
+        git clone https://github.com/meetcost/meetcost.git
+        cd meetcost
+        ```
+      </Step>
 
-<Steps>
-  <Step title="Install">
-    Describe how to install your product or sign up.
+      <Step title="Create your environment file">
+        Copy the example env file. You will fill in the encryption key in the next step.
 
-    ```bash
-    npm install your-package
-    ```
-  </Step>
-  <Step title="Configure">
-    Describe any setup or configuration needed before first use.
+        ```bash
+        cp .env.example .env
+        ```
+      </Step>
 
-    ```bash
-    your-cli init
-    ```
-  </Step>
-  <Step title="Run it">
-    Show the first thing a user does to see it working.
+      <Step title="Generate an encryption key">
+        Pay values are stored encrypted with AES-256-GCM under a key you supply. Generate one now and paste it into `.env` as `MEETCOST_ENCRYPTION_KEY`.
 
-    ```bash
-    your-cli start
-    ```
-  </Step>
-</Steps>
+        ```bash
+        docker compose run --rm meetcost meetcost genkey
+        ```
+
+        Open `.env` in your editor and set:
+
+        ```ini
+        MEETCOST_ENCRYPTION_KEY=<paste the output here>
+        ```
+      </Step>
+
+      <Step title="Start the service">
+        ```bash
+        docker compose up -d
+        ```
+
+        The service will be available at `http://localhost:8000`.
+      </Step>
+
+      <Step title="Seed demo data">
+        The `seed-demo` command creates eight fictional employees with pay records, assigns roles, and injects a few completed meetings so the reports pages are not empty.
+
+        ```bash
+        docker compose exec meetcost meetcost seed-demo
+        ```
+
+        Expected output:
+
+        ```
+        Seeded 8 people, pay records, and 4 completed meetings.
+        Admin: ada@example.com — mint a token with: meetcost token ada@example.com
+        ```
+      </Step>
+
+      <Step title="Open the admin UI">
+        Visit [http://localhost:8000/admin](http://localhost:8000/admin), click **Get a development token**, and enter `ada@example.com`. Ada is the seeded admin user.
+      </Step>
+    </Steps>
+  </Tab>
+
+  <Tab title="Without Docker">
+    <Steps>
+      <Step title="Clone the repository">
+        ```bash
+        git clone https://github.com/meetcost/meetcost.git
+        cd meetcost
+        ```
+      </Step>
+
+      <Step title="Create a virtual environment and install dependencies">
+        ```bash
+        python3 -m venv .venv
+        ./.venv/bin/pip install -e ".[dev]"
+        ```
+
+        This installs the `meetcost` CLI, the FastAPI service, and the development dependencies (pytest, ruff).
+      </Step>
+
+      <Step title="Create your environment file">
+        ```bash
+        cp .env.example .env
+        ```
+      </Step>
+
+      <Step title="Generate an encryption key">
+        Pay values are stored encrypted with AES-256-GCM under a key you supply. Generate one now and paste it into `.env` as `MEETCOST_ENCRYPTION_KEY`.
+
+        ```bash
+        ./.venv/bin/meetcost genkey
+        ```
+
+        Open `.env` in your editor and set:
+
+        ```ini
+        MEETCOST_ENCRYPTION_KEY=<paste the output here>
+        ```
+      </Step>
+
+      <Step title="Seed demo data">
+        The `seed-demo` command creates eight fictional employees with pay records, assigns roles, and injects a few completed meetings so the reports pages are not empty on first load.
+
+        ```bash
+        ./.venv/bin/meetcost seed-demo
+        ```
+
+        Expected output:
+
+        ```
+        Seeded 8 people, pay records, and 4 completed meetings.
+        Admin: ada@example.com — mint a token with: meetcost token ada@example.com
+        ```
+      </Step>
+
+      <Step title="Start the service">
+        ```bash
+        ./.venv/bin/meetcost serve
+        ```
+
+        The service will be listening at `http://localhost:8000`. Leave this terminal running.
+      </Step>
+    </Steps>
+  </Tab>
+</Tabs>
+
+## Get a development token
+
+The `meetcost token` command mints a short-lived JWT signed with your `MEETCOST_SECRET_KEY`. It works only when `MEETCOST_ENVIRONMENT` is not `production`.
+
+```bash
+./.venv/bin/meetcost token ada@example.com
+```
+
+This prints the token to stdout. The curl example below captures it into a shell variable in one step.
+
+<Warning>
+  Development tokens are signed with a local secret and are not verified against an identity provider. They are refused entirely in production. Use `MEETCOST_AUTH_MODE=oidc` with your own OIDC issuer for any non-local deployment.
+</Warning>
+
+## Call the estimate endpoint
+
+With the service running and demo data seeded, ask for the cost of a one-hour weekly sync with all eight demo employees:
+
+```bash
+TOKEN=$(./.venv/bin/meetcost token ada@example.com)
+
+curl -s localhost:8000/api/v1/estimate \
+  -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+  -d '{"invitees":["ada@example.com","bola@example.com","chen@example.com",
+                   "dia@example.com","emeka@example.com","fatima@example.com",
+                   "gus@example.com","hana@example.com"],
+       "duration_minutes":60,"cadence":"weekly"}' | jq
+```
+
+The response includes the per-occurrence cost, the annualised total for the given cadence, and any configured nudges:
+
+```json
+{
+  "cost": { "visible": true, "total": "649.38", "currency": "USD", "headcount": 8 },
+  "annualised_total": "33767.76",
+  "nudges": [
+    { "code": "cost_above_threshold",
+      "message": "This meeting costs about USD 649. Could a written update do the same job?" },
+    { "code": "annualised",
+      "message": "At this cadence that is about USD 33,768 a year." }
+  ]
+}
+```
 
 <Tip>
-  Give people a way to get help. This could be a link to a support page, a chat with a customer support agent, or a forum for your product.
-
-  Example: Need help? Reach out to us at [support@yourcompany.com](mailto:support@yourcompany.com).
+  The annualised figure — USD 33,768 in this example — is the number the product exists to surface. It is computed from `per_occurrence_cost × occurrences_per_year` for the given cadence. For `weekly` that is 52 occurrences. For a `one_off` cadence, `annualised_total` is omitted because an annual figure would be meaningless.
 </Tip>
+
+### Understanding the response
+
+| Field | Meaning |
+|---|---|
+| `cost.total` | The total cost for one occurrence of this meeting at the given duration |
+| `cost.currency` | The currency of all pay records consulted. A mixed-currency invitee list returns an error instead |
+| `cost.headcount` | Number of invitees included in the calculation |
+| `annualised_total` | `cost.total × occurrences_per_year` for the given cadence |
+| `nudges` | Zero or more advisory messages triggered by configured thresholds (cost, headcount, duration) |
+
+### Cadence values
+
+The `cadence` field accepts: `one_off`, `daily`, `weekdaily`, `weekly`, `biweekly`, `monthly`, `quarterly`.
+
+## What the demo data looks like
+
+`seed-demo` creates the following people and roles:
+
+| Email | Name | Team | Annual Pay (USD) | Role |
+|---|---|---|---|---|
+| ada@example.com | Ada Okonkwo | Engineering | 165,000 | admin |
+| bola@example.com | Bola Mensah | Engineering | 142,000 | participant |
+| chen@example.com | Chen Wei | Engineering | 128,000 | participant |
+| dia@example.com | Dia Farrell | Product | 151,000 | team_lead |
+| emeka@example.com | Emeka Nwosu | Product | 118,000 | participant |
+| fatima@example.com | Fatima Rahman | Finance | 134,000 | finance |
+| gus@example.com | Gus Lindqvist | Sales | 97,000 | participant |
+| hana@example.com | Hana Suzuki | Sales | 104,000 | participant |
+
+It also injects three weekly all-hands meetings (from the past three weeks) and one monthly roadmap review, so the digests and reports endpoints return real data.
+
+## Assigning roles from the CLI
+
+You can grant roles without going through the admin UI:
+
+```bash
+./.venv/bin/meetcost grant fatima@example.com finance
+./.venv/bin/meetcost grant dia@example.com team_lead --team-id product
+```
+
+Valid roles are `participant`, `organiser`, `team_lead`, `finance`, and `admin`.
+
+## Running the tests
+
+The test suite runs with no network access and completes in a few seconds:
+
+```bash
+./.venv/bin/pytest
+```
+
+The most important test is `server/tests/test_no_egress.py`, which asserts that the service makes no outbound connections to any host that is not in the configured egress allowlist — this is the test that keeps the data-residency claim honest.
+
+## Next steps
+
+<CardGroup cols={2}>
+  <Card title="Production Deployment" icon="server" href="/deployment">
+    Switch to Postgres, configure OIDC against your identity provider, supply an encryption key from your secret manager, and deploy with the provided Helm chart.
+  </Card>
+  <Card title="Architecture" icon="sitemap" href="/architecture">
+    Understand the four-layer code structure, storage schema, boot sequence, and extension points.
+  </Card>
+  <Card title="Permissions" icon="lock" href="/security/permissions">
+    Full detail on the role model, salary-inference protections, and the small-meeting rounding rules.
+  </Card>
+  <Card title="Adapters" icon="plug" href="/integrations/adapters">
+    Connect a directory provider (Google, Microsoft), an attendance collector, or an HRIS for automated pay data sync.
+  </Card>
+</CardGroup>

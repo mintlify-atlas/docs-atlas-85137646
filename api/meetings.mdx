@@ -1,0 +1,240 @@
+---
+title: "Meeting Summary and Ingest API Endpoints"
+sidebarTitle: "/meetings"
+description: "Retrieve post-meeting cost summaries by meeting ID or provider ID, list meetings you organised, and manually ingest meetings from unsupported platforms."
+---
+
+The meetings endpoints provide post-meeting cost summaries computed from actual attendance and duration — not the scheduled figures. A meeting booked for an hour that ran 25 minutes with three no-shows is reported as what it was: 25 minutes of actual cost for however many people stayed. MeetCost applies the same disclosure policy redaction here as on estimates, so what a caller can see depends on their role and their relationship to the meeting.
+
+---
+
+## GET /api/v1/meetings/{meeting_id}/summary
+
+Returns the post-meeting cost summary for a single meeting, identified by MeetCost's internal meeting ID. The response is redacted according to the caller's role and the org's disclosure policy.
+
+**Access control:** Callers who attended or organised the meeting see it at their normal role. A caller who was neither an attendee nor the organiser must have at least the `team_lead` role to retrieve the summary — otherwise the server returns `403 Forbidden`.
+
+### Path parameters
+
+<ParamField path="meeting_id" type="string" required>
+  MeetCost's internal meeting ID (returned as `meeting_id` in all meeting summary responses).
+</ParamField>
+
+### Response body
+
+<ResponseField name="meeting_id" type="string">
+  MeetCost's internal meeting ID.
+</ResponseField>
+
+<ResponseField name="provider" type="string">
+  The platform that hosted the meeting: `google`, `microsoft`, or `zoom`.
+</ResponseField>
+
+<ResponseField name="title" type="string | null">
+  Meeting title from the calendar event, if available.
+</ResponseField>
+
+<ResponseField name="organiser_email" type="string | null">
+  Email address of the meeting organiser.
+</ResponseField>
+
+<ResponseField name="started_at" type="string | null">
+  ISO 8601 datetime of actual start (not scheduled start).
+</ResponseField>
+
+<ResponseField name="duration_minutes" type="number | null">
+  Actual meeting duration in minutes (not scheduled duration).
+</ResponseField>
+
+<ResponseField name="cost" type="object">
+  Cost result, subject to disclosure policy. Same structure as the `cost` object in estimate responses — see [POST /api/v1/estimate](/api/estimate) for field descriptions.
+</ResponseField>
+
+<ResponseField name="estimated_total" type="string | null">
+  The scheduling-time estimate total, if one was captured. Allows comparison of what the organiser expected versus what the meeting actually cost.
+</ResponseField>
+
+<ResponseField name="actual_vs_estimate" type="string | null">
+  Difference between `cost.total` and `estimated_total`, as a signed decimal string. Positive means the meeting cost more than estimated; negative means it cost less.
+</ResponseField>
+
+<ResponseField name="late_join_minutes" type="number | null">
+  Aggregate minutes of late joins across all participants. Only present when `cost.visible` is `true`.
+</ResponseField>
+
+<ResponseField name="annualised_total" type="string | null">
+  Annual run-rate for recurring meetings, or `null` for one-off meetings.
+</ResponseField>
+
+<ResponseField name="coverage_note" type="string | null">
+  Explanation when some participants were priced at the fallback rate. Same semantics as on estimate responses.
+</ResponseField>
+
+### Response example
+
+```json
+{
+  "meeting_id": "d4e5f6a7b8c9...",
+  "provider": "google",
+  "title": "Weekly team standup",
+  "organiser_email": "ada@example.com",
+  "started_at": "2026-09-01T09:03:00Z",
+  "duration_minutes": "27",
+  "cost": {
+    "visible": true,
+    "total": "189.42",
+    "currency": "USD",
+    "headcount": 5,
+    "duration_minutes": "27",
+    "total_is_approximate": false,
+    "estimated_headcount": 0,
+    "participants": null,
+    "redactions": ["breakdown_disabled_by_policy"]
+  },
+  "estimated_total": "324.69",
+  "actual_vs_estimate": "-135.27",
+  "late_join_minutes": "14",
+  "annualised_total": "9849.84",
+  "coverage_note": null
+}
+```
+
+---
+
+## GET /api/v1/meetings/by-provider/{provider}/{provider_meeting_id}/summary
+
+Same as the endpoint above, but addressed by the provider's own meeting ID rather than MeetCost's internal ID. This is typically more convenient for add-in clients, which receive the provider's ID from the calendar event directly.
+
+### Path parameters
+
+<ParamField path="provider" type="string" required>
+  The meeting platform: `google`, `microsoft`, or `zoom`.
+</ParamField>
+
+<ParamField path="provider_meeting_id" type="string" required>
+  The provider's meeting identifier — the UUID or numeric ID from the calendar event or meeting object. Maximum 200 characters.
+</ParamField>
+
+<Warning>
+**A 404 from this endpoint is normal during and shortly after a meeting.** Providers publish attendance data minutes to hours after the meeting ends. If you call this endpoint while a meeting is ongoing, or shortly after it finishes, you will get `404 Not Found`. Show the user "summary not yet available" — not "no cost" or "zero". Check back later.
+</Warning>
+
+### Request example
+
+```bash
+curl https://meetcost.acme-corp.internal/api/v1/meetings/by-provider/zoom/abc123DEF456 \
+  -H "Authorization: Bearer <token>"
+```
+
+---
+
+## GET /api/v1/meetings/mine
+
+Returns a list of meetings the authenticated caller organised, ordered most-recent first. Applies the organiser disclosure rules (the caller always sees their own meeting totals, subject to org policy).
+
+### Query parameters
+
+<ParamField query="limit" type="integer" default="20">
+  Maximum number of meetings to return. Capped at 100.
+</ParamField>
+
+### Response
+
+An array of meeting summary objects, each with the same structure as the `GET /api/v1/meetings/{meeting_id}/summary` response.
+
+### Request example
+
+```bash
+curl "https://meetcost.acme-corp.internal/api/v1/meetings/mine?limit=10" \
+  -H "Authorization: Bearer <token>"
+```
+
+---
+
+## POST /api/v1/meetings/ingest
+
+Manually record a completed meeting from a platform that MeetCost has no built-in collector for. Requires admin role or a service token.
+
+**Idempotent on `(provider, provider_meeting_id)`:** Submitting the same meeting twice writes it only once. This is intentional — provider webhook systems and polling collectors retry on failure, and a retry must not double-count a meeting in the monthly report.
+
+<Note>
+Webhook deliveries from Zoom and Microsoft Graph go through the `/webhooks/...` endpoints instead, where the provider's signature is verified first. Use `/meetings/ingest` for platforms without a webhook, or for one-off manual imports.
+</Note>
+
+### Request body
+
+<ParamField body="provider" type="string" required>
+  Platform identifier for this meeting, e.g. `"webex"`, `"bluejeans"`, `"custom"`. Maximum 20 characters.
+</ParamField>
+
+<ParamField body="provider_meeting_id" type="string" required>
+  The provider's own meeting identifier. Used for idempotency checks. Maximum 200 characters.
+</ParamField>
+
+<ParamField body="attendance" type="array" required>
+  List of attendees and their participation details.
+
+  <Expandable title="attendance item fields">
+    <ParamField body="attendance[].email" type="string" required>
+      Attendee's email address.
+    </ParamField>
+    <ParamField body="attendance[].minutes" type="number" required>
+      Minutes the person was present in the meeting. Must be 0–1440.
+    </ParamField>
+    <ParamField body="attendance[].late_join_minutes" type="number" default="0">
+      Minutes by which the person joined late. Must be 0 or greater.
+    </ParamField>
+  </Expandable>
+</ParamField>
+
+<ParamField body="title" type="string">
+  Meeting title. Optional.
+</ParamField>
+
+<ParamField body="organiser_email" type="string">
+  Email address of the meeting organiser. Optional.
+</ParamField>
+
+<ParamField body="series_id" type="string">
+  Recurring series identifier from the provider, if applicable. Used to group meetings in reports.
+</ParamField>
+
+<ParamField body="cadence" type="string" default="one_off">
+  Meeting cadence. Same values as the estimate endpoint: `one_off`, `daily`, `weekdaily`, `weekly`, `biweekly`, `monthly`, `quarterly`.
+</ParamField>
+
+<ParamField body="actual_start" type="string">
+  ISO 8601 datetime of the actual meeting start.
+</ParamField>
+
+<ParamField body="actual_end" type="string">
+  ISO 8601 datetime of the actual meeting end.
+</ParamField>
+
+<ParamField body="scheduled_minutes" type="number">
+  Scheduled duration in minutes. Stored for comparison against actual duration.
+</ParamField>
+
+### Request example
+
+```json
+{
+  "provider": "webex",
+  "provider_meeting_id": "webex-mtg-98765",
+  "attendance": [
+    { "email": "ada@example.com", "minutes": 45, "late_join_minutes": 0 },
+    { "email": "bola@example.com", "minutes": 45, "late_join_minutes": 5 },
+    { "email": "cara@example.com", "minutes": 30, "late_join_minutes": 0 }
+  ],
+  "title": "Product review",
+  "organiser_email": "ada@example.com",
+  "cadence": "weekly",
+  "actual_start": "2026-09-01T14:00:00Z",
+  "actual_end": "2026-09-01T14:45:00Z",
+  "scheduled_minutes": 60
+}
+```
+
+### Response
+
+Returns a full meeting summary response object (same structure as `GET /api/v1/meetings/{meeting_id}/summary`). After ingestion, the meeting is costed immediately and the summary is dispatched to any configured notification channels.

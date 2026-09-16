@@ -1,0 +1,260 @@
+---
+title: "Admin Console and Pay Data Management"
+sidebarTitle: "Admin"
+description: "Upload and manage employee pay data, configure disclosure policy, assign roles, and review the full audit log of every pay-data access."
+---
+
+The admin console is the control surface for everything that touches pay data: uploading salary records, configuring how costs are calculated and disclosed, assigning roles, and reviewing who has seen what. Every route that touches a pay figure writes its audit row in the same database transaction as the read — a read that was not logged is a read that did not commit. Nothing in the admin surface is a privileged back door; the browser page calls the same audited API that any other authenticated client would use.
+
+## The admin console
+
+Open `/admin` in a browser. In a local development deployment you will see a **Get a development token** button — enter any email address from your directory to mint a token for that user. This button does not exist in production; the route `POST /api/v1/dev/token` returns `404` outside development mode.
+
+From the console you can upload pay data, view and edit configuration, manage roles, and inspect the audit log — all within the permissions your own token carries.
+
+## Pay data
+
+### CSV upload
+
+```
+POST /api/v1/admin/pay/upload
+```
+
+Upload a CSV file containing employee pay records. The service recognises common column name aliases from payroll exports so you do not need to reformat the file:
+
+| Canonical column | Accepted aliases |
+|---|---|
+| `employee_email` | `email`, `work_email`, `user`, `userprincipalname` |
+| `annual_pay` | `pay`, `amount`, `salary`, `base_pay`, `annual_salary` |
+| `currency` | `ccy`, `currency_code` |
+| `effective_date` | `effective`, `as_of`, `start_date`, `valid_from` |
+| `pay_basis` | `basis`, `pay_type`, `employment_type` |
+
+`employee_email` and `annual_pay` are required. `currency` defaults to the org's `base_currency`. `effective_date` defaults to today. `pay_basis` accepts `annual` or `hourly` (and common synonyms); it defaults to `annual`.
+
+**Upload is all-or-nothing.** Any bad row means nothing is written. Every error is reported at once so you can fix them in one pass rather than one upload at a time.
+
+<Tabs>
+  <Tab title="Dry run">
+    Validate the file without writing anything:
+
+    ```bash
+    curl -s localhost:8000/api/v1/admin/pay/upload?dry_run=true \
+      -H "Authorization: Bearer $TOKEN" \
+      -F "file=@payroll_q3.csv"
+    ```
+
+    The response shows how many rows would be created or updated, and lists every validation error.
+  </Tab>
+  <Tab title="Live upload">
+    ```bash
+    curl -s localhost:8000/api/v1/admin/pay/upload \
+      -H "Authorization: Bearer $TOKEN" \
+      -F "file=@payroll_q3.csv"
+    ```
+
+    ```json
+    {
+      "created": 12,
+      "updated": 3,
+      "skipped": 0,
+      "errors": []
+    }
+    ```
+  </Tab>
+  <Tab title="CLI">
+    The `meetcost import-pay` command wraps the upload endpoint and streams file content over the API:
+
+    ```bash
+    # Validate first
+    meetcost import-pay payroll_q3.csv --dry-run
+
+    # Write for real
+    meetcost import-pay payroll_q3.csv
+    ```
+
+    Exit code is non-zero if any row fails validation, making it safe to use in CI or a deployment pipeline.
+  </Tab>
+</Tabs>
+
+Records are keyed by `(employee_email, effective_date)`. Re-uploading the same effective date corrects that version; a new effective date adds a new version and preserves history.
+
+### Manual pay entry
+
+```
+POST /api/v1/admin/pay
+```
+
+Add or update a single pay record without a CSV file:
+
+```json
+{
+  "employee_email": "ada@example.com",
+  "annual_pay": "95000",
+  "currency": "GBP",
+  "effective_date": "2026-04-01",
+  "pay_basis": "annual"
+}
+```
+
+### Viewing pay records
+
+```
+GET /api/v1/admin/pay
+```
+
+Returns the latest record per person, masked by default. The `amount` field is omitted and replaced with a `masked` display value.
+
+To decrypt and view actual amounts:
+
+```
+GET /api/v1/admin/pay?reveal=true
+```
+
+<Warning>
+`?reveal=true` writes **one audit row per person** in the result set, in the same transaction as the decryption. Every reveal is on the record. Use `?target=<email>` on the audit log to see who has revealed a specific person's data.
+</Warning>
+
+### Deleting a person's pay data
+
+```
+DELETE /api/v1/admin/pay/{email}
+```
+
+Deletes **all versions** of a person's pay record — not just the current one. Use this for leavers and for erasure requests under data protection law. The delete is audited.
+
+### Coverage report
+
+```
+GET /api/v1/admin/coverage
+```
+
+Available to Finance and Admin roles. Answers "will estimates be any good?" by showing how much of the directory is covered by pay data and how stale the most recent records are:
+
+```json
+{
+  "directory_people": 240,
+  "covered_people": 218,
+  "uncovered_people": 22,
+  "coverage_percent": 90.8,
+  "total_records": 231,
+  "newest_effective_date": "2026-04-01",
+  "oldest_effective_date": "2022-01-01",
+  "stale": false
+}
+```
+
+`stale` is `true` when the newest effective date is older than `pay_data_max_age_days` (configurable, default 180 days).
+
+## Policy configuration
+
+```
+GET  /api/v1/admin/config
+PATCH /api/v1/admin/config
+```
+
+`PATCH` accepts any subset of the editable fields. All changes are audited with before-and-after values.
+
+| Setting | Type | Default | Description |
+|---|---|---|---|
+| `loading_factor` | decimal | `1.30` | Employer cost multiplier applied to base pay |
+| `working_hours_per_year` | int | `2080` | Annual hours divisor for salaried staff |
+| `fallback_annual_pay` | decimal | `0` | Org-wide rate for people without a pay record. `0` means those people contribute nothing to estimates. |
+| `base_currency` | string | `USD` | Currency used for the fallback rate and reports |
+| `per_person_breakdown_enabled` | bool | `false` | Whether per-person cost breakdowns are shown to admins and finance viewers |
+| `small_meeting_threshold` | int | `5` | Meetings below this headcount suppress per-person breakdowns regardless of other policy |
+| `participants_see_cost` | bool | `false` | Whether meeting participants can see cost summaries (default: organiser-only) |
+| `finance_can_view_raw_pay` | bool | `false` | Whether the finance role can reveal decrypted pay amounts |
+| `band_small_meeting_totals` | bool | `true` | Whether totals for small meetings are rounded to 2 significant figures for non-admin viewers |
+| `nudge_cost_threshold` | decimal | — | Cost above which the `cost_above_threshold` nudge fires. `0` disables. |
+| `nudge_headcount_threshold` | int | — | Headcount above which the `headcount_above_threshold` nudge fires. `0` disables. |
+| `nudge_duration_minutes_threshold` | int | — | Duration above which the `duration_above_threshold` nudge fires. `0` disables. |
+| `pay_data_max_age_days` | int | `180` | Days after which pay data is considered stale in the coverage report |
+
+<Warning>
+**`participants_see_cost` defaults to `false` deliberately.** Shared summaries are the strongest behaviour lever and the biggest cultural risk. Talk to HR and your works council before enabling this. In a two-person meeting, the total minus your own cost is your colleague's exact pay.
+</Warning>
+
+Example patch:
+
+```bash
+curl -s -X PATCH localhost:8000/api/v1/admin/config \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "loading_factor": "1.28",
+    "nudge_cost_threshold": "400",
+    "participants_see_cost": false
+  }'
+```
+
+## Role management
+
+```
+GET    /api/v1/admin/roles
+PUT    /api/v1/admin/roles
+DELETE /api/v1/admin/roles
+```
+
+Available roles are `participant`, `organiser`, `team_lead`, `finance`, and `admin`. Team lead assignments include a `team_id` to scope their report access:
+
+```json
+{
+  "email": "bola@example.com",
+  "role": "team_lead",
+  "team_id": "engineering"
+}
+```
+
+Role grants and revocations are both audited with `role.grant` and `role.revoke` actions.
+
+## Audit log
+
+```
+GET /api/v1/admin/audit
+```
+
+Returns audited events in reverse chronological order. Filter by actor, action, or target email:
+
+```bash
+# See who has accessed a specific person's pay data
+GET /api/v1/admin/audit?target=ada@example.com
+
+# See all pay reveals in the last 30 days
+GET /api/v1/admin/audit?action=pay.view
+```
+
+The audit log records the actor, their role at the time, the action, the target (per-person for bulk accesses — a single "exported 400 rows" entry would not answer "who has seen my salary?"), a timestamp, and the source IP. **The log never records an amount** — it records that a value was accessed and by whom.
+
+Audited actions include:
+
+| Action | Triggered by |
+|---|---|
+| `pay.view` | `GET /api/v1/admin/pay?reveal=true` |
+| `pay.export` | `GET /api/v1/admin/pay/export.csv` |
+| `pay.import` | CSV upload or manual entry |
+| `pay.delete` | `DELETE /api/v1/admin/pay/{email}` |
+| `config.update` | `PATCH /api/v1/admin/config` (before/after values recorded) |
+| `role.grant` / `role.revoke` | `PUT` / `DELETE /api/v1/admin/roles` |
+| `report.view` / `report.export` | `GET /api/v1/reports` and `GET /api/v1/reports/export.csv` |
+| `breakdown.view` | Per-person breakdown accessed in a summary |
+| `directory.sync` / `hris.sync` | Manual or scheduled sync |
+
+## Directory and HRIS sync
+
+```
+POST /api/v1/admin/sync/directory
+POST /api/v1/admin/sync/hris
+```
+
+Trigger an immediate sync rather than waiting for the next scheduled pull. Both endpoints return the number of records created, updated, and skipped.
+
+To check which adapters have credentials configured:
+
+```
+GET /api/v1/admin/adapters
+```
+
+## Audit-on-read guarantee
+
+Every route that touches a pay figure — `GET /api/v1/admin/pay?reveal=true`, the export, any internal decryption path — writes its audit row **in the same database transaction as the read**. If the transaction does not commit, neither the read nor the audit row survives. A read that was not logged is a read that did not commit.

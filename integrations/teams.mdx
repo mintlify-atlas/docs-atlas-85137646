@@ -1,0 +1,246 @@
+---
+title: "MeetCost Microsoft Teams App Setup Guide"
+sidebarTitle: "Teams"
+description: "Add MeetCost to Microsoft Teams and Outlook to display meeting cost estimates. Configure Microsoft 365 credentials, the Graph API webhook, and the Teams app manifest."
+---
+
+The MeetCost Teams app and Outlook add-in are a single page that serves three surfaces from one deployment: an Outlook appointment compose pane that shows a live estimate while the organiser writes the invite, a Teams meeting side panel that shows what the meeting has cost once Graph publishes its call record, and a Teams personal tab with a manual estimator for planning. All three surfaces send meeting context to your organisation's own MeetCost backend; no salary, rate, or cost figure ever reaches Microsoft.
+
+## How the app works
+
+<Tabs>
+  <Tab title="Outlook compose">
+    When loaded in Outlook, the page detects `Office.context.mailbox` and enters compose mode. The Office JS API fires `RecipientsChanged` and `AppointmentTimeChanged` events as the organiser edits the invite; each change debounces into a single POST to `/api/v1/estimate`. The organiser sees the cost estimate update in the task pane in real time without any interaction.
+  </Tab>
+  <Tab title="Teams meeting side panel">
+    When loaded in a Teams meeting context, the page calls `microsoftTeams.app.getContext()` to get the meeting ID, then calls `client.summaryByProviderId(meetingId)` to fetch the post-meeting cost from your backend. Graph publishes the call record a few minutes after the meeting ends; until then, the panel displays a clear waiting message rather than showing a zero — an empty meeting and an unpublished record are different things and must not look the same.
+  </Tab>
+  <Tab title="Manual estimator">
+    When neither the Office nor the Teams SDK is present (personal tab, local development, or unsupported context), the page shows a manual estimator: paste email addresses, set a duration and cadence, and see the estimate.
+  </Tab>
+</Tabs>
+
+---
+
+## Prerequisites
+
+- A deployed MeetCost backend reachable over HTTPS.
+- A **Microsoft Entra ID** app registration for the Teams client (delegated `openid` and `email` permissions only — this registration is for identity, not for Graph API calls).
+- A separate Entra app registration on the **server** side with application permissions `User.Read.All` and `CallRecords.Read.All` (see [Directory sync](#directory-sync) below).
+- Hosting for the static files in `clients/teams-app/` (or serve them from the MeetCost service itself).
+
+---
+
+## Installation
+
+<Steps>
+  <Step title="Host the static files">
+    Serve `clients/teams-app/` over HTTPS. If you serve it from the MeetCost service itself, the client falls back to the page's own origin and no `config.js` is needed.
+
+    Otherwise copy the example config and set the backend address:
+
+    ```bash
+    cp clients/teams-app/config.example.js clients/teams-app/config.js
+    ```
+
+    ```javascript
+    // config.js
+    window.MEETCOST_BACKEND_URL = "https://meetcost.your-company.example";
+    ```
+
+    The token source does not need to be configured for most deployments: inside Teams the client automatically uses `microsoftTeams.authentication.getAuthToken()`, and elsewhere it fetches `/auth/token` on the same origin.
+  </Step>
+
+  <Step title="Vendor the Teams JS SDK">
+    Download the Teams JS SDK bundle into `vendor/teams-js.min.js`:
+
+    ```bash
+    # Pin the version you download. Check the file into your deployment artefact.
+    curl -o clients/teams-app/vendor/teams-js.min.js <the Microsoft Teams JS bundle URL>
+    ```
+
+    Loading from a CDN at runtime means that CDN controls the file. Vendoring removes that dependency.
+  </Step>
+
+  <Step title="Register the client app in Entra ID">
+    In the [Entra admin centre](https://entra.microsoft.com), register a new application for the Teams client. It needs only delegated permissions:
+
+    - `openid`
+    - `email`
+
+    MeetCost verifies the token the Teams SDK already holds for the user — it does not call Graph on the user's behalf. Note the **Application (client) ID** from this registration; you will need it in the manifest and for `MEETCOST_OIDC_AUDIENCE`.
+  </Step>
+
+  <Step title="Edit the manifest">
+    Edit `clients/teams-app/manifest.json`. Replace every occurrence of `meetcost.your-company.example` with your actual hostname, generate a GUID for the `id` field, and fill in `webApplicationInfo` with your Entra app details:
+
+    ```json
+    {
+      "id": "REPLACE-WITH-YOUR-OWN-GUID",
+      "validDomains": ["meetcost.your-company.example"],
+      "webApplicationInfo": {
+        "id": "REPLACE-WITH-YOUR-ENTRA-APP-ID",
+        "resource": "api://meetcost.your-company.example/REPLACE-WITH-YOUR-ENTRA-APP-ID"
+      }
+    }
+    ```
+
+    The full manifest schema version is `1.17`. The `configurableTabs` entry points at `meetingSidePanel` and `meetingDetailsTab`; the `staticTabs` entry covers the personal tab.
+  </Step>
+
+  <Step title="Package and upload the app">
+    Zip `manifest.json`, `icon-color.png` (192×192), and `icon-outline.png` (32×32) together, then upload the zip in the **Teams admin centre** under Apps → Manage apps → Upload. No Microsoft review is needed for an internal deployment.
+  </Step>
+
+  <Step title="Set the server environment variables">
+    On your MeetCost backend, configure the Microsoft adapter:
+
+    | Variable | Description |
+    |---|---|
+    | `MEETCOST_MICROSOFT_TENANT_ID` | Your Entra tenant ID |
+    | `MEETCOST_MICROSOFT_CLIENT_ID` | Server-side app registration client ID |
+    | `MEETCOST_MICROSOFT_CLIENT_SECRET` | Server-side app registration client secret |
+    | `MEETCOST_GRAPH_WEBHOOK_CLIENT_STATE` | A secret string you choose; Graph sends it back on every notification |
+    | `MEETCOST_OIDC_AUDIENCE` | The client-side Entra app ID (from step 3), for token verification |
+
+    When these variables are set, `graph.microsoft.com` and `login.microsoftonline.com` are automatically added to the backend's egress allowlist.
+  </Step>
+
+  <Step title="Install the Outlook add-in (optional)">
+    `outlook-addin/manifest.xml` is a separate sideload for Outlook. Replace the same placeholders and upload it through the **Microsoft 365 admin centre**. The add-in requests only `ReadItem` — the narrowest permission that can see an attendee list — and never writes to the mailbox.
+  </Step>
+</Steps>
+
+---
+
+## Authentication
+
+Inside Teams, the client calls `microsoftTeams.authentication.getAuthToken()` to obtain the user's Microsoft-issued OIDC token. The backend verifies this token against the OIDC issuer:
+
+```
+https://login.microsoftonline.com/<MEETCOST_MICROSOFT_TENANT_ID>/v2.0
+```
+
+Set `MEETCOST_OIDC_AUDIENCE` to your client-side Entra app ID so the backend validates the `aud` claim in the token. MeetCost has no accounts and no passwords.
+
+```javascript
+// From clients/teams-app/app.js — token acquisition
+function getToken() {
+  if (window.MEETCOST_GET_TOKEN) return window.MEETCOST_GET_TOKEN();
+  if (window.microsoftTeams && microsoftTeams.authentication) {
+    return microsoftTeams.authentication.getAuthToken();
+  }
+  return fetch("/auth/token", { credentials: "same-origin", cache: "no-store" })
+    .then(function (response) {
+      if (!response.ok) throw new Error("Not signed in");
+      return response.json();
+    })
+    .then(function (data) {
+      return data.token || data.id_token;
+    });
+}
+```
+
+---
+
+## Directory sync
+
+The Microsoft directory adapter uses the **client credentials flow** against your tenant to obtain an access token, then pages through `GET https://graph.microsoft.com/v1.0/users` selecting `id`, `mail`, `userPrincipalName`, `displayName`, `department`, `jobTitle`, and `accountEnabled`. Each user's `department` field becomes their `team_id` for reports grouping.
+
+### Required Graph application permissions
+
+Grant these **application permissions** (not delegated) to the **server-side** Entra app registration:
+
+| Permission | Purpose |
+|---|---|
+| `User.Read.All` | Read the full directory for pay lookup and reports grouping |
+| `CallRecords.Read.All` | Read Teams call records for post-meeting attendance |
+
+<Warning>
+These permissions require **admin consent** in your tenant. The client-side registration (used for the Teams app identity) does **not** need these permissions.
+</Warning>
+
+---
+
+## Graph webhook: call record notifications
+
+When a Teams meeting ends, Graph publishes a `callRecord` resource and sends a change notification to your configured endpoint. Set up a subscription pointing at:
+
+```
+POST https://<your-meetcost>/webhooks/microsoft
+```
+
+Set the subscription's `clientState` to the same value as `MEETCOST_GRAPH_WEBHOOK_CLIENT_STATE`.
+
+### Validation handshake
+
+When Graph first validates the subscription URL, it sends a GET request with a `validationToken` query parameter. The MeetCost backend echoes the token as a plain-text `200` response. This is handled automatically.
+
+### Notification handling
+
+On each notification, the backend:
+
+1. Checks that `clientState` matches `MEETCOST_GRAPH_WEBHOOK_CLIENT_STATE`. Any notification that fails this check is discarded.
+2. Reads the call record ID from the notification body.
+3. Fetches the full call record from `GET https://graph.microsoft.com/v1.0/communications/callRecords/{id}?$expand=sessions` using server credentials.
+4. Builds a `MeetingRecord` from the sessions.
+
+The notification body is used only to learn which meeting ended. Attendance is fetched from Graph with server credentials, so a forged notification cannot inject a cost figure.
+
+---
+
+## Attendance collection: session overlap handling
+
+Graph reports attendance as a list of sessions between endpoints. A person who drops and rejoins contributes multiple sessions. The Microsoft adapter takes the **union** of a person's session spans, not their sum, so overlapping or adjacent sessions are not double-counted:
+
+```python
+# From server/meetcost/adapters/microsoft.py
+def _merged_minutes(ranges: list[tuple]) -> Decimal:
+    """Union of possibly-overlapping (start, end) spans, in minutes."""
+    if not ranges:
+        return Decimal("0")
+    ordered = sorted(ranges)
+    total = timedelta()
+    current_start, current_end = ordered[0]
+    for start, end in ordered[1:]:
+        if start <= current_end:
+            current_end = max(current_end, end)
+        else:
+            total += current_end - current_start
+            current_start, current_end = start, end
+    total += current_end - current_start
+    return _round(Decimal(total.total_seconds()) / Decimal(60))
+```
+
+Participants who appear in the record but never connected (no sessions) contribute zero minutes rather than being dropped — no-shows are a meaningful signal in meeting reports and must not be hidden.
+
+---
+
+## Local development
+
+Serve the folder directly, without Teams or Outlook:
+
+```bash
+python3 -m http.server 8080 --directory clients/teams-app
+```
+
+When both SDKs are absent the page falls back to the manual estimator. Set `window.MEETCOST_BACKEND_URL` in `config.js` to your local backend.
+
+---
+
+## Security model
+
+<CardGroup cols={2}>
+  <Card title="No pay data to Microsoft" icon="shield-check">
+    The app sends attendee addresses and times. The backend returns a cost total already redacted for the caller. No salary or rate figure travels to Microsoft infrastructure.
+  </Card>
+  <Card title="clientState validation" icon="lock">
+    Every Graph notification is checked against `MEETCOST_GRAPH_WEBHOOK_CLIENT_STATE`. Notifications that fail the check are silently discarded.
+  </Card>
+  <Card title="Separated app registrations" icon="key">
+    The client-side registration (identity only) is separate from the server-side registration (directory and call records). A compromised client token cannot be used to read Graph data.
+  </Card>
+  <Card title="ReadItem only in Outlook" icon="eye">
+    The Outlook add-in requests `ReadItem`, the minimum permission to read an attendee list. It never writes to the mailbox or calendar.
+  </Card>
+</CardGroup>

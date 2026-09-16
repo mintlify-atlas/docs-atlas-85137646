@@ -1,0 +1,157 @@
+---
+title: "What MeetCost Transmits and What It Keeps Private"
+sidebarTitle: "Privacy"
+description: "A precise account of every outbound connection MeetCost makes, what data crosses each wire, and how to verify these claims with tests, config inspection, and tcpdump."
+---
+
+MeetCost exists because meeting-cost tools are normally SaaS, and using them means shipping payroll data to a third party. This page states precisely what crosses which wire — including the parts that are less comfortable — and explains the enforcement mechanism that backs each claim. It is the document to check first, and to hold the project to. The claims here are asserted by `server/tests/test_no_egress.py`, which runs on every commit. If a claim below stops being true, that test fails.
+
+---
+
+## The short version
+
+<CardGroup cols={2}>
+  <Card title="Pay data never leaves" icon="lock">
+    Not to this project — there is no "us" to send it to — and not to Google, Microsoft, or Zoom.
+  </Card>
+  <Card title="No cost figure sent to calendar vendors" icon="calendar-xmark">
+    Not the total, not a rate, not a per-person number. Not in any direction.
+  </Card>
+  <Card title="No vendor-operated endpoint" icon="server">
+    MeetCost has no servers. The software runs on yours.
+  </Card>
+  <Card title="No telemetry" icon="eye-slash">
+    No analytics, no crash reporting, no phone-home. Not optional-and-on-by-default. Absent.
+  </Card>
+  <Card title="Directory sync reads only" icon="magnifying-glass">
+    MeetCost holds no write scope to Google Workspace, Microsoft 365, or Zoom. It never modifies your directory.
+  </Card>
+  <Card title="Configurable destinations only" icon="sliders">
+    The egress allowlist is derived entirely from your configuration. Configure nothing and MeetCost connects to nothing but your database.
+  </Card>
+</CardGroup>
+
+---
+
+## The honest caveat
+
+Meeting metadata — the title, the attendee list, the start and end times — is **already** in Google's, Microsoft's, or Zoom's cloud, because that is where the meeting was scheduled. MeetCost does not change that and does not pretend to.
+
+What MeetCost adds is the cost calculation, and that calculation happens entirely inside your own deployment. The add-ins send meeting details *from* the vendor's client *to* your backend. Nothing travels in the other direction.
+
+So the accurate claim is not "MeetCost keeps your meetings private". It is: **MeetCost does not send anything additional to your calendar vendor, and never sends anything about pay to anyone.**
+
+---
+
+## Every outbound connection
+
+MeetCost maintains a runtime allowlist of hosts it may connect to. The list is derived entirely from your configuration — a host appears on it only because you supplied a credential or a URL that implies it. Any connection to a host not on the list is refused at the socket layer, before a packet is sent.
+
+| Destination | When | What is sent | Configured by |
+|---|---|---|---|
+| Your Postgres | Always | Everything MeetCost stores | `MEETCOST_DATABASE_URL` |
+| Your identity provider | Verifying a login token | Nothing — a public-key fetch only | `MEETCOST_OIDC_ISSUER` |
+| Your SMTP server | Sending a summary or digest | The cost figures in that email | `MEETCOST_SMTP_HOST` |
+| Your chat webhook | Posting a meeting summary | The cost figure and meeting title | `MEETCOST_CHAT_WEBHOOK_URL` |
+| Your HRIS | Pay sync | An API request. Pay data comes back; none goes out | `MEETCOST_HRIS_BASE_URL` |
+| `admin.googleapis.com` | Directory or attendance read | An access-token request, then a read of your tenant | `MEETCOST_GOOGLE_*` |
+| `graph.microsoft.com` | Directory or attendance read | An access-token request, then a read of your tenant | `MEETCOST_MICROSOFT_*` |
+| `api.zoom.us` | Directory or attendance read | An access-token request, then a read of your tenant | `MEETCOST_ZOOM_*` |
+
+The last three entries are your own tenant's APIs, reachable only because you supplied that tenant's credentials. **Nothing sent to Google, Microsoft, or Zoom contains a salary, a rate, or a cost.** The requests are reads: "list the users in this account", "what was the attendance for this meeting".
+
+---
+
+## What the add-ins send
+
+The Meet, Teams, and Zoom clients talk to **one** host: the MeetCost backend address your administrator configured. They ship with no default address — if one is not configured they display a setup message rather than guessing.
+
+Each client sends:
+
+- The attendee email addresses on the meeting being viewed
+- Its duration and recurrence
+- The identity token the host platform already issued to the user
+
+Each client receives a total that has **already been redacted** for that particular viewer. A client never receives pay data, and never receives a per-person breakdown it is not permitted to show. Compromising a client therefore discloses nothing an attacker could not read off the calendar invite itself.
+
+---
+
+## How pay is stored
+
+| Data | Where | Protection |
+|---|---|---|
+| Pay amounts | `pay_records.amount_encrypted` | AES-256-GCM under a 256-bit key **you** supply. The employee's address is bound in as additional authenticated data (AAD), so a row copied between employees fails to decrypt rather than reporting the wrong salary. Stored as `v1.<b64url nonce>.<b64url ciphertext+tag>` |
+| Directory entries | `people` | Plain. Names and teams, as your directory already holds them |
+| Meeting metadata and costs | `meetings`, `meeting_participants` | Plain. Derived from data already in your calendar system |
+| Access to pay data | `audit_events` | Append-only. Records *that* a value was read and by whom — never the value itself |
+
+The encryption key is yours. MeetCost does not generate one it retains, cannot recover your data without it, and has no key-escrow mechanism.
+
+<Warning>
+Store the encryption key and the database backups in different places. Together they are the payroll file. Separately, neither is.
+</Warning>
+
+---
+
+## What MeetCost deliberately does not do
+
+<CardGroup cols={2}>
+  <Card title="No per-person rankings" icon="ranking-star">
+    No "who spends most time in meetings" table, in the product or in exports. That is individual productivity scoring, which is out of scope by design.
+  </Card>
+  <Card title="No per-person breakdown by default" icon="user-slash">
+    Because pay is stored per individual, a per-participant cost breakdown is a salary disclosure. It is off at every level below Admin and requires a deliberate change to enable.
+  </Card>
+  <Card title="No precise totals for small meetings" icon="chart-bar">
+    A two-person total minus your own cost is your colleague's exact salary. Below the suppression threshold, non-admin viewers see a total rounded to two significant figures and labelled approximate.
+  </Card>
+  <Card title="No hard blocking" icon="ban">
+    MeetCost shows a number and a prompt. It never prevents anyone from scheduling anything.
+  </Card>
+</CardGroup>
+
+---
+
+## Verifying these claims yourself
+
+You do not have to take this page's word for it.
+
+<Tabs>
+  <Tab title="Test suite">
+    Run the residency test suite, which covers runtime enforcement, configuration, and a source scan:
+
+    ```bash
+    pytest server/tests/test_no_egress.py -v
+    ```
+  </Tab>
+  <Tab title="Config inspection">
+    Inspect what this specific deployment is permitted to reach:
+
+    ```bash
+    # From the CLI
+    meetcost config | grep -A20 egress_allowlist
+
+    # Or ask the running service directly
+    curl -s https://your-meetcost/readyz | jq .egress_allowlist
+    ```
+  </Tab>
+  <Tab title="Network capture">
+    Watch it at the network layer, on a host with nothing else running:
+
+    ```bash
+    sudo tcpdump -i any -n 'tcp and not port 22'
+    ```
+
+    Every connection MeetCost makes will appear here. Any unexpected destination is worth reporting — see the [Security policy](https://github.com/SedemBalfour/MeetCost/security/advisories/new).
+  </Tab>
+</Tabs>
+
+---
+
+## Reporting a discrepancy
+
+If you find MeetCost contacting a host it should not, or transmitting data this page says it does not, that is a security issue — not a bug. Report it privately before any public disclosure. See the project's security policy for how.
+
+<Tip>
+See [Data Protection](/security/data-protection) for the full account of what personal data MeetCost holds and how to service data subject rights, and [Permissions](/security/permissions) for how disclosure is controlled per role.
+</Tip>

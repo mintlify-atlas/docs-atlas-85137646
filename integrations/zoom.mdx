@@ -1,0 +1,212 @@
+---
+title: "MeetCost Zoom App Setup Guide"
+sidebarTitle: "Zoom"
+description: "Deploy the MeetCost Zoom app to show cost estimates during Zoom meetings. Configure your Zoom OAuth credentials and webhook for attendance collection."
+---
+
+The MeetCost Zoom app gives meeting participants a live running cost that climbs in real time while the meeting is open — the number is visible to the people spending it, while they can still choose to finish early. Outside a meeting, the same page becomes a manual estimator for planning ahead. The app is a set of static files in `clients/zoom-app/` that you host on your own infrastructure; it sends meeting context to your MeetCost backend and renders what comes back, without ever receiving or holding pay data.
+
+## How the app works
+
+<Tabs>
+  <Tab title="In a meeting">
+    When loaded inside the Zoom client, the app calls `zoomSdk.getMeetingContext()` to confirm it is in a live meeting, then calls `zoomSdk.getMeetingParticipants()` every 60 seconds to collect participant email addresses. Each tick posts to `/api/v1/estimate` on your backend with the current elapsed minutes and the participant list. The running total updates on screen as the clock runs.
+
+    If Zoom does not return participant emails — which depends on scopes and whether participants are in the same account — the panel says so rather than silently costing a smaller meeting than the one taking place.
+  </Tab>
+  <Tab title="Outside a meeting">
+    When the Zoom SDK (`zoomSdk`) is absent, the page falls back to a manual estimator: a form where you paste email addresses, set a duration in minutes, and choose a cadence. This is also the mode used during local development.
+  </Tab>
+</Tabs>
+
+---
+
+## Prerequisites
+
+- A deployed MeetCost backend reachable over HTTPS.
+- A **Zoom Server-to-Server OAuth** app created in the [Zoom Marketplace](https://marketplace.zoom.us/). This app type uses account-level credentials — no user authorization flow — which is what the backend adapter uses for directory sync and the Reports API.
+- Hosting for the static files in `clients/zoom-app/` (or serve them from the MeetCost service itself; see below).
+
+---
+
+## Installation
+
+<Steps>
+  <Step title="Host the static files">
+    Serve the `clients/zoom-app/` directory over HTTPS from your own infrastructure. If you serve them from the MeetCost service itself, the client automatically uses the page origin as the backend URL and no `config.js` is needed at all.
+
+    Otherwise, copy the example config and set the backend address:
+
+    ```bash
+    cp clients/zoom-app/config.example.js clients/zoom-app/config.js
+    ```
+
+    ```javascript
+    // config.js
+    window.MEETCOST_BACKEND_URL = "https://meetcost.your-company.example";
+    ```
+  </Step>
+
+  <Step title="Vendor the Zoom Apps SDK">
+    The app loads the Zoom SDK from `vendor/zoom-appssdk.min.js`, not from a CDN. Download the SDK bundle and place it there:
+
+    ```bash
+    # Pin the version you download and check the file into your deployment artefact.
+    curl -o clients/zoom-app/vendor/zoom-appssdk.min.js <the Zoom Apps SDK bundle URL>
+    ```
+
+    Loading a script from a third-party CDN at runtime means that party controls the page's behaviour. Vendoring eliminates that dependency.
+  </Step>
+
+  <Step title="Create the Zoom Marketplace app">
+    In [marketplace.zoom.us](https://marketplace.zoom.us/), create a **Zoom App** with these settings:
+
+    - **Home URL**: your hosted `index.html`
+    - **Domain allow list**: your MeetCost hostname
+    - **Scopes**: `user:read`, `meeting:read` (for the client-side panel), plus `user:read:admin` and `report:read:admin` on the server-to-server credentials the backend uses
+    - **Features → APIs**: `getMeetingContext`, `getUserContext`, `getMeetingParticipants`, `onParticipantChange`
+
+    Publish the app privately to your account. A public Marketplace listing requires Zoom's review process — begin that early if you need one.
+  </Step>
+
+  <Step title="Set the server-to-server credentials">
+    On your MeetCost backend, set these environment variables using the credentials from your Zoom Server-to-Server OAuth app:
+
+    | Variable | Description |
+    |---|---|
+    | `MEETCOST_ZOOM_ACCOUNT_ID` | Your Zoom account ID |
+    | `MEETCOST_ZOOM_CLIENT_ID` | OAuth app client ID |
+    | `MEETCOST_ZOOM_CLIENT_SECRET` | OAuth app client secret |
+    | `MEETCOST_ZOOM_WEBHOOK_SECRET` | Secret token from the Zoom event subscription (for webhook verification) |
+
+    When these variables are set, `api.zoom.us` and `zoom.us` are automatically added to the backend's egress allowlist.
+  </Step>
+
+  <Step title="Configure the webhook">
+    In the Zoom Marketplace app, under **Event Subscriptions**, subscribe to **Meeting → Meeting has ended** and set the notification endpoint to:
+
+    ```
+    POST https://<your-meetcost>/webhooks/zoom
+    ```
+
+    Zoom will perform a URL validation handshake; the MeetCost backend answers it automatically.
+  </Step>
+</Steps>
+
+---
+
+## Authentication
+
+The Zoom app does not use Zoom's identity for MeetCost authentication — Zoom app scopes do not include a general identity token suitable for server verification. Instead, `config.js` supplies a `MEETCOST_GET_TOKEN` function appropriate to how your organisation authenticates.
+
+<Tabs>
+  <Tab title="SSO proxy (recommended)">
+    If the app is served behind an SSO proxy such as `oauth2-proxy`, the proxy can expose the user's identity token on the same origin. This is the default behaviour when `MEETCOST_GET_TOKEN` is not defined:
+
+    ```javascript
+    // config.js — default token source (same as built-in fallback)
+    window.MEETCOST_GET_TOKEN = function () {
+      return fetch("/auth/token", { credentials: "same-origin", cache: "no-store" })
+        .then(function (response) {
+          if (!response.ok) throw new Error("Not signed in");
+          return response.json();
+        })
+        .then(function (data) {
+          return data.token || data.id_token;
+        });
+    };
+    ```
+  </Tab>
+  <Tab title="Pre-injected token">
+    If your wrapper page injects the token before loading the app:
+
+    ```javascript
+    // config.js — use a token injected by the host page
+    window.MEETCOST_GET_TOKEN = function () {
+      return Promise.resolve(window.__ORG_ID_TOKEN__);
+    };
+    ```
+  </Tab>
+</Tabs>
+
+---
+
+## Webhook: meeting.ended
+
+When a meeting ends, Zoom sends a `meeting.ended` event to the configured endpoint. The MeetCost backend:
+
+1. Verifies the `x-zm-signature` header — an HMAC-SHA256 signature over `v0:<timestamp>:<raw body>` using `MEETCOST_ZOOM_WEBHOOK_SECRET`.
+2. Uses the meeting ID from the body to fetch attendance from the **Reports API** with the backend's own server-to-server credentials.
+3. Stores the resulting `MeetingRecord` for post-meeting summary queries.
+
+The webhook body is used only to learn which meeting ended. Attendance is never taken from the webhook payload itself — a forged webhook therefore cannot inject a cost figure.
+
+<Note>
+The URL validation handshake Zoom sends when you first configure the subscription is handled automatically. You do not need to do anything special; just set `MEETCOST_ZOOM_WEBHOOK_SECRET` before the endpoint receives the first request.
+</Note>
+
+### Signature verification
+
+```
+x-zm-signature: v0=<hex digest>
+
+Message = "v0:" + x-zm-request-timestamp + ":" + raw_body
+HMAC-SHA256(MEETCOST_ZOOM_WEBHOOK_SECRET, Message)
+```
+
+---
+
+## Directory sync
+
+The Zoom directory adapter authenticates via server-to-server OAuth (account credentials grant) against `https://zoom.us/oauth/token`, then pages through `GET https://api.zoom.us/v2/users` with `status=active` and `page_size=300`. Each user's `dept` field becomes their `team_id` for reports grouping.
+
+The required admin scopes are `user:read:admin` and `report:read:admin`.
+
+---
+
+## Attendance collection: reconnection handling
+
+Zoom emits **one Reports API row per join event**. When a participant drops and rejoins, they appear twice. The Zoom adapter sums their connected seconds across all rows rather than counting them as two attendees:
+
+```python
+# From server/meetcost/adapters/zoom.py
+# Zoom emits one row per join. Someone who reconnects appears twice; sum
+# their connected time rather than counting them as two attendees.
+entry = merged.setdefault(email, {"seconds": 0, "first_join": join_time})
+entry["seconds"] += seconds
+if join_time and (entry["first_join"] is None or join_time < entry["first_join"]):
+    entry["first_join"] = join_time
+```
+
+Participants who joined via phone dial-in or as unauthenticated guests have no email address and are skipped — they cannot be costed, so they are omitted rather than given an invented identity.
+
+---
+
+## Local development
+
+Serve the folder directly and open it in a browser — no Zoom client needed:
+
+```bash
+python3 -m http.server 8080 --directory clients/zoom-app
+```
+
+When `zoomSdk` is absent, the page automatically falls back to the manual estimator. Set `window.MEETCOST_BACKEND_URL` in `config.js` to your local backend and the estimator works end to end.
+
+---
+
+## Security model
+
+<CardGroup cols={2}>
+  <Card title="No pay data to Zoom" icon="shield-check">
+    The app sends attendee email addresses and elapsed time to your backend. It never receives a salary, rate, or cost figure — the backend redacts before responding.
+  </Card>
+  <Card title="No default backend" icon="lock">
+    There is no fallback URL. A client without a configured `MEETCOST_BACKEND_URL` renders a setup message and contacts nothing. The build test `test_no_egress.py` enforces this.
+  </Card>
+  <Card title="Vendored SDK" icon="box">
+    The Zoom Apps SDK is loaded from `vendor/`, not a CDN. Third-party CDNs control the files they serve; vendoring removes that dependency from your production page.
+  </Card>
+  <Card title="Forged webhook safety" icon="webhook">
+    Attendance comes from the Reports API using server credentials, not from the webhook body. HMAC verification prevents replay; a forged or replayed webhook has no pay data to inject.
+  </Card>
+</CardGroup>

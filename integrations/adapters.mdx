@@ -1,0 +1,314 @@
+---
+title: "Writing Custom Adapters for MeetCost"
+sidebarTitle: "Adapters"
+description: "Implement the DirectoryProvider, AttendanceCollector, or HRISProvider protocol to add support for a new calendar platform, HR system, or directory service."
+---
+
+MeetCost is extended through adapters: small, self-contained classes that implement one of three protocols and register themselves with a decorator. Adding support for a new calendar platform, HR system, or directory service means writing one class and importing it in `adapters/__init__.py` — it never means touching the core. All bundled adapters (Google, Microsoft, Zoom, BambooHR) follow the same rules and are the best reference for what a production adapter looks like.
+
+---
+
+## The three protocols
+
+| Protocol | Reads | Bundled implementations |
+|---|---|---|
+| `DirectoryProvider` | People and teams from the org's own directory | `GoogleDirectory`, `MicrosoftDirectory`, `ZoomDirectory` |
+| `AttendanceCollector` | Who actually attended a finished meeting | `GoogleMeetAttendance`, `TeamsAttendance`, `ZoomAttendance` |
+| `HRISProvider` | Pay figures from an HR system | `BambooHR` |
+
+Each protocol is defined in `server/meetcost/adapters/base.py` as an abstract base class. The data classes it uses — `DirectoryPerson`, `PayImportRow`, `AttendanceRecord`, `MeetingRecord` — are also defined there.
+
+---
+
+## Rules every adapter follows
+
+<Note>
+These five rules are not suggestions. They apply to every adapter, bundled or custom, and the egress guard enforces the last one regardless of what an adapter tries to do.
+</Note>
+
+1. **Read-only.** No adapter writes to an upstream system. If you find yourself needing a write scope, something has gone wrong.
+2. **The org's own tenant only.** Adapters read from systems the organisation already owns, with credentials the operator supplied.
+3. **Unconfigured means inert.** `is_configured()` returns `False` when credentials are absent, and nothing is contacted. An unconfigured adapter is the expected state for platforms an organisation does not use — not an error.
+4. **Errors name the fix.** Raise `AdapterNotConfigured` with the environment variables an operator needs to set, not just "not configured".
+5. **The egress guard applies regardless.** An adapter that tries to reach a host outside the configured allowlist is refused at the socket layer. You do not need to defend against this; you need to know it will happen.
+
+---
+
+## HRIS adapters
+
+`server/meetcost/adapters/hris_bamboohr.py` is the reference implementation — about sixty lines of substance, showing the three things every HRIS adapter must do: authenticate, page through the full employee list, and map each record to a `PayImportRow`.
+
+### Class skeleton
+
+```python
+from meetcost.adapters.base import (
+    AdapterError, AdapterNotConfigured, HRISProvider, PayImportRow, register_hris,
+)
+from meetcost.rates import PayBasis
+
+
+@register_hris
+class Workday(HRISProvider):
+    name = "workday"
+
+    def __init__(self, settings=None):
+        self._settings = settings or get_settings()
+
+    def is_configured(self) -> bool:
+        return bool(self._settings.hris_base_url and self._settings.hris_api_key)
+
+    def fetch_pay(self):
+        if not self.is_configured():
+            raise AdapterNotConfigured(
+                "Set MEETCOST_HRIS_BASE_URL and MEETCOST_HRIS_API_KEY"
+            )
+        response = httpx.get(
+            f"{self._settings.hris_base_url}/workers",
+            headers={"Authorization": f"Bearer {self._settings.hris_api_key}"},
+            timeout=60.0,
+        )
+        if response.status_code != 200:
+            raise AdapterError(f"Workday read failed: {response.status_code}")
+
+        for worker in response.json().get("data", []):
+            row = _to_row(worker)
+            if row is not None:
+                yield row
+```
+
+### Mapping pay correctly
+
+This is where adapters go wrong most often.
+
+**Annualise salaried staff, and only salaried staff.** An HR system stores a rate plus a period. Multiply monthly by 12, biweekly by 26, semi-monthly by 24, weekly by 52, and so on. `hris_bamboohr.py` has the full multiplier table:
+
+```python
+_PERIODS_PER_YEAR = {
+    "weekly": Decimal(52),
+    "biweekly": Decimal(26),
+    "bi-weekly": Decimal(26),
+    "semimonthly": Decimal(24),
+    "semi-monthly": Decimal(24),
+    "monthly": Decimal(12),
+    "quarterly": Decimal(4),
+    "yearly": Decimal(1),
+    "annually": Decimal(1),
+    "annual": Decimal(1),
+}
+```
+
+**Never annualise hourly staff.** Set `pay_basis=PayBasis.HOURLY` and pass the hourly rate through untouched. The rate engine divides an hourly rate by 60 to get cost-per-minute and does not apply `working_hours_per_year` at all. Annualising an hourly rate and then dividing back down by an assumed 2,080-hour year reintroduces exactly the assumption that makes the figure wrong.
+
+**Skip rather than guess.** A worker with no usable pay figure should be omitted, not defaulted to zero. Omitted people fall through to the org-wide fallback rate and are labelled as estimates; a zero silently understates the meeting.
+
+**Carry the currency.** Do not convert. A meeting spanning currencies is refused with an explanation rather than summed into a meaningless number.
+
+**Set `effective_date` from the source.** Records are versioned by it, so a meeting costed last quarter can still be explained with the rate that applied then.
+
+```python
+def _to_row(row, effective):
+    email = (row.get("workEmail") or "").strip().lower()
+    if not email or "@" not in email:
+        return None
+    if str(row.get("status", "Active")).lower() != "active":
+        return None
+
+    amount, currency = _parse_rate(row.get("payRate"))
+    if amount is None or amount <= 0:
+        return None  # skip, don't default to zero
+
+    pay_type = str(row.get("payType") or "").strip().lower()
+    if pay_type == "hourly":
+        return PayImportRow(
+            employee_email=email,
+            amount=amount,
+            currency=currency,
+            effective_date=_parse_date(row.get("hireDate")) or effective,
+            pay_basis=PayBasis.HOURLY,  # never annualise
+        )
+
+    multiplier = _PERIODS_PER_YEAR.get(str(row.get("payPeriod") or "").strip().lower(), Decimal(1))
+    return PayImportRow(
+        employee_email=email,
+        amount=amount * multiplier,
+        currency=currency,
+        effective_date=_parse_date(row.get("hireDate")) or effective,
+        pay_basis=PayBasis.ANNUAL,
+    )
+```
+
+---
+
+## Directory adapters
+
+A directory adapter yields `DirectoryPerson` instances for every active employee. The sync marks anyone who disappears from a subsequent run as inactive rather than deleting them, because past meetings still need a name and a team to report against.
+
+```python
+from meetcost.adapters.base import DirectoryPerson, DirectoryProvider, register_directory
+
+
+@register_directory
+class LDAPDirectory(DirectoryProvider):
+    name = "ldap"
+
+    def is_configured(self) -> bool:
+        ...
+
+    def list_people(self):
+        yield DirectoryPerson(
+            email="ada@example.com",
+            display_name="Ada Okonkwo",
+            team_id="engineering",     # what reports group by
+            team_name="Engineering",   # what humans read
+            department="Engineering",
+            manager_email="dia@example.com",
+            is_active=True,
+        )
+```
+
+### DirectoryPerson fields
+
+| Field | Type | Notes |
+|---|---|---|
+| `email` | `str` | Primary work email. Must be unique and lowercase. |
+| `display_name` | `str \| None` | Human-readable name shown in reports. |
+| `team_id` | `str \| None` | **Stability matters more than prettiness.** This is what reports group by. If it changes, historical reports regroup under the new value. Use a slug or department code rather than a display string that HR might rename. |
+| `team_name` | `str \| None` | Readable label for `team_id`, shown in the UI. |
+| `department` | `str \| None` | Freeform department string, separate from `team_id`. |
+| `manager_email` | `str \| None` | Used for org-chart views. |
+| `is_active` | `bool` | `False` marks the person as inactive. Never hard-delete directory records. |
+
+---
+
+## Attendance collectors
+
+An attendance collector returns a `MeetingRecord` for one finished meeting, or `None` if the provider has not published the record yet. It can also implement `poll_recent` for platforms without an end-of-meeting webhook.
+
+```python
+from meetcost.adapters.base import (
+    AttendanceCollector, MeetingRecord, register_attendance,
+)
+
+
+@register_attendance
+class WebexAttendance(AttendanceCollector):
+    name = "webex"
+
+    def is_configured(self) -> bool:
+        ...
+
+    def fetch_meeting(self, provider_meeting_id: str):
+        """Return a MeetingRecord, or None if the provider has no record yet."""
+        ...
+
+    def poll_recent(self, since):
+        """Only needed where there is no usable end-of-meeting webhook."""
+        ...
+```
+
+### `fetch_meeting` returning `None` is not an error
+
+Providers publish attendance minutes to hours after a meeting ends. Returning `None` means "not yet" — which must be distinguishable from an empty `MeetingRecord` meaning "nobody came". One is worth retrying; the other is a real, empty meeting. Never substitute an empty record for a missing one.
+
+### Four tricky attendance cases
+
+<CardGroup cols={2}>
+  <Card title="Reconnections = one person" icon="rotate">
+    **Zoom emits one row per join.** Sum a reconnecting participant's `duration` values across all rows rather than counting them as two attendees. The Zoom adapter uses a `merged` dict keyed by email for exactly this.
+  </Card>
+  <Card title="Overlapping sessions: union, not sum" icon="layer-group">
+    **Graph reports concurrent sessions.** Take the union of a person's time spans. Summing overlapping intervals overstates the time they were connected. See `_merged_minutes` in the Microsoft adapter.
+  </Card>
+  <Card title="No-shows at zero minutes" icon="user-slash">
+    **Dropping no-shows hides the most useful signal a meeting report has.** Include participants who never connected with `minutes=Decimal("0")` rather than omitting them.
+  </Card>
+  <Card title="Skip participants with no address" icon="phone-slash">
+    **Dial-in guests and unauthenticated participants cannot be costed.** Omit them rather than inventing an identity. The `if not email or "@" not in email: continue` pattern appears in every bundled collector.
+  </Card>
+</CardGroup>
+
+---
+
+## Testing an adapter
+
+Test the mapping, not the network. Every bundled adapter separates its transport from a pure `_record_from_*` function precisely so the mapping can be tested against a captured payload literal — no network required.
+
+### The `_record_from_*` pattern
+
+```python
+# The transport layer fetches the raw payload and delegates:
+def fetch_meeting(self, provider_meeting_id):
+    response = httpx.get(f"{API}/meetings/{provider_meeting_id}/participants", ...)
+    return _record_from_webex(provider_meeting_id, META, response.json())
+
+# The pure mapping function is testable with a literal:
+def _record_from_webex(meeting_id, meta, participants):
+    ...
+```
+
+### Pytest example
+
+```python
+def test_maps_a_reconnecting_participant_to_one_attendee():
+    record = _record_from_webex("m-1", META, [
+        {"email": "ada@example.com", "duration": 600},
+        {"email": "ada@example.com", "duration": 900},
+    ])
+    assert len(record.attendance) == 1
+    assert record.attendance[0].minutes == Decimal("25.00")
+```
+
+Add real payloads you have captured — with names changed — as fixtures in `server/tests/fixtures/`. A vendor's documented schema and their actual API responses are not always the same thing, and a captured payload is the only reliable record of the difference.
+
+<Tip>
+The tests should pass without a network connection. `test_no_egress.py` enforces the no-default-URL rule; your adapter tests should enforce the mapping. A PR whose tests require live credentials will not pass CI.
+</Tip>
+
+---
+
+## Registering an adapter
+
+<Steps>
+  <Step title="Decorate the class">
+    Use the appropriate decorator. The decorator registers the class in the in-memory registry under `cls.name`:
+
+    ```python
+    @register_hris        # for HRISProvider subclasses
+    @register_directory   # for DirectoryProvider subclasses
+    @register_attendance  # for AttendanceCollector subclasses
+    class MyAdapter(...):
+        name = "myadapter"
+    ```
+  </Step>
+
+  <Step title="Import in adapters/__init__.py">
+    The decorator only fires when the module is imported. Add an import line to `server/meetcost/adapters/__init__.py`:
+
+    ```python
+    from . import hris_bamboohr   # existing
+    from . import hris_myvendor   # your new adapter
+    ```
+  </Step>
+
+  <Step title="Verify registration">
+    Once the server is running, call the admin endpoint to confirm the adapter appears:
+
+    ```bash
+    curl https://meetcost.your-company.example/api/v1/admin/adapters
+    ```
+
+    The response lists every registered adapter by type and name, together with whether it is currently configured.
+  </Step>
+</Steps>
+
+---
+
+## Contributing an adapter back
+
+Adapters are the most useful contribution to this project. Open a pull request containing:
+
+1. **The adapter module** in `server/meetcost/adapters/`.
+2. **Tests** in `server/tests/` — with at least one captured payload fixture and tests that pass without a network connection.
+3. **A paragraph in `docs/ADAPTERS.md`** describing the vendor, the authentication method, and any non-obvious mapping decisions.
+
+You do not need access to the vendor's system to get a review. The tests should pass without a network, which is the point: a reviewer can validate the mapping logic without a test account.

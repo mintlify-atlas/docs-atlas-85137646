@@ -1,0 +1,162 @@
+---
+title: "Webhook Endpoints for Zoom and Microsoft Teams"
+sidebarTitle: "/webhooks"
+description: "MeetCost receives end-of-meeting webhooks from Zoom and Microsoft Graph. Each webhook supplies only a meeting ID; attendance is fetched with service credentials."
+---
+
+MeetCost receives end-of-meeting events from Zoom and Microsoft Graph via inbound webhooks. These endpoints are unauthenticated by design — they are called by the provider's servers, not by your users — and each provider's own signature scheme is verified before any action occurs. The Google Meet path works differently: Google has no push webhook for meeting end events, so MeetCost instead exposes an authenticated poll trigger that your scheduler calls on a cron schedule.
+
+<Note>
+**Exposure note:** The webhook endpoints (`/webhooks/zoom` and `/webhooks/microsoft`) are the only MeetCost surfaces that must be reachable from the public internet. Everything else can sit behind your internal network. Both webhook endpoints verify signatures before taking any action.
+</Note>
+
+---
+
+## The core security property
+
+A webhook body supplies **only a meeting ID**. MeetCost uses that ID to fetch attendance from the provider's API using its own pre-configured service credentials. No cost figure, attendance count, or duration value is ever read from the webhook body itself.
+
+This means a forged or replayed webhook results in exactly one authenticated read against your own tenant — the same read that would have happened legitimately. There is no injection vector, and there is nothing in the payload that could inflate a cost figure.
+
+---
+
+## POST /webhooks/zoom
+
+Receives Zoom `meeting.ended` events and handles the URL-validation handshake that Zoom sends when you first configure a webhook subscription. This endpoint is called by Zoom's servers, not by your users. No `Authorization` header is required or expected.
+
+**Required configuration:** `MEETCOST_ZOOM_WEBHOOK_SECRET`
+
+### Signature verification
+
+Zoom signs every delivery with an HMAC-SHA256 signature over the string `v0:<timestamp>:<body>`. The result is sent in the `x-zm-signature` header as `v0=<hex-digest>`, and the timestamp is in `x-zm-request-timestamp`.
+
+MeetCost verifies this signature before doing anything else. A request with a missing or mismatched signature receives `401 Unauthorized`. A missing `MEETCOST_ZOOM_WEBHOOK_SECRET` returns `503 Service Unavailable`.
+
+### URL-validation handshake
+
+When you register a new webhook endpoint in the Zoom marketplace, Zoom sends a validation request with `event: "endpoint.url_validation"`. MeetCost handles this automatically by computing the expected HMAC over the `plainToken` and returning:
+
+```json
+{
+  "plainToken": "<token Zoom sent>",
+  "encryptedToken": "<HMAC-SHA256 hex digest>"
+}
+```
+
+No configuration is needed; the handshake is handled transparently.
+
+### meeting.ended events
+
+When Zoom sends `event: "meeting.ended"`, MeetCost extracts the meeting UUID from `payload.object.uuid` (falling back to `payload.object.id`), queues an attendance-collection task in the background, and immediately returns:
+
+```json
+{
+  "status": "accepted",
+  "meeting": "<meeting-uuid>"
+}
+```
+
+The background task fetches full attendance from the Zoom Reports API using your configured `MEETCOST_ZOOM_CLIENT_ID` and `MEETCOST_ZOOM_CLIENT_SECRET`, ingests the meeting, computes costs, and dispatches the post-meeting summary notification.
+
+Any other event type is acknowledged and ignored:
+
+```json
+{
+  "status": "ignored",
+  "event": "meeting.participant_joined"
+}
+```
+
+### Headers Zoom sends
+
+| Header | Description |
+|---|---|
+| `x-zm-signature` | `v0=<HMAC-SHA256 hex digest>` over `v0:<timestamp>:<body>` |
+| `x-zm-request-timestamp` | Unix epoch timestamp as a string, used in the signature message |
+
+### Example — forged webhook impact
+
+An attacker who sends a valid-looking body but without the correct HMAC receives `401`. If somehow a request passed signature verification with a fake meeting ID that does not exist in your Zoom account, the attendance fetch would return an empty result or a 404 from Zoom's API, and MeetCost would record nothing. No cost is computed from the webhook body itself.
+
+---
+
+## POST /webhooks/microsoft
+
+Receives Microsoft Graph `callRecords` change notifications, and handles the subscription validation challenge. Called by Microsoft's servers; no `Authorization` header is expected.
+
+**Required configuration:** `MEETCOST_GRAPH_WEBHOOK_CLIENT_STATE`
+
+### Subscription validation
+
+When you create a Graph change-notification subscription, Microsoft immediately sends a GET request with a `validationToken` query parameter. MeetCost echoes this value back as plain text with `Content-Type: text/plain`, within the 10-second window Graph requires.
+
+```
+GET /webhooks/microsoft?validationToken=abc123
+→ 200 OK
+   Content-Type: text/plain
+
+   abc123
+```
+
+### Change notifications
+
+For `callRecords` notifications, Graph sends a POST with a JSON body containing a `value` array of notification objects. MeetCost validates each notification's `clientState` against `MEETCOST_GRAPH_WEBHOOK_CLIENT_STATE` using a constant-time comparison. Notifications with a mismatched `clientState` are silently discarded (as Graph's documentation requires).
+
+For accepted notifications, MeetCost extracts `resourceData.id` and queues an attendance-collection background task. The response is always `202 Accepted`.
+
+### clientState validation
+
+```
+MEETCOST_GRAPH_WEBHOOK_CLIENT_STATE=your-shared-secret
+```
+
+Set this to a long random string when you create your Graph subscription (`clientState` field). MeetCost checks it on every notification. A notification without the correct state is dropped without logging an error (to avoid log spam from legitimate Graph retries during subscription rotation).
+
+### Why forged notifications are harmless
+
+A notification body contains only a `resourceData.id`. If a forged `id` is sent, MeetCost will make one authenticated call to `https://graph.microsoft.com/v1.0/communications/callRecords/<id>` using your tenant's credentials. If the record does not exist in your tenant, Graph returns 404 and no data is ingested.
+
+---
+
+## POST /webhooks/google/poll
+
+Google Meet does not publish end-of-meeting webhooks. Instead, attendance data becomes available in the Google Workspace Reports API some time after the meeting ends. MeetCost exposes this authenticated trigger endpoint so the sweep can be driven by your own scheduler — a Kubernetes CronJob, a cloud scheduler, or the MeetCost CLI — rather than an in-process timer that might silently fail.
+
+**This is not a webhook.** It is a normal authenticated API endpoint that happens to sit on the `/webhooks/` path for operational grouping.
+
+**Requires:** Admin role or a service token.
+
+### Query parameters
+
+<ParamField query="hours" type="integer" default="24">
+  Look back this many hours in the Reports API sweep. Use a window that slightly overlaps your cron interval to avoid gaps. The recommended cron invocation uses `--hours 3` on a 2-hour schedule.
+</ParamField>
+
+### Response
+
+```json
+{
+  "status": "accepted",
+  "window_hours": 3
+}
+```
+
+The sweep runs in the background. MeetCost queries the Reports API for meetings that ended within the window, ingests any that are not already recorded, costs them, and dispatches post-meeting summaries.
+
+### Recommended cron setup
+
+```bash
+# Run every 2 hours; sweep the last 3 hours to ensure overlap
+meetcost collect google --hours 3
+```
+
+Or as a direct API call from a Kubernetes CronJob:
+
+```bash
+curl -X POST "https://meetcost.acme-corp.internal/webhooks/google/poll?hours=3" \
+  -H "Authorization: Bearer <service-token>"
+```
+
+<Tip>
+Use a service token (from `MEETCOST_SERVICE_TOKENS`) for cron-driven calls. Service tokens carry admin-level access and do not expire, making them appropriate for automated jobs that run without human interaction.
+</Tip>

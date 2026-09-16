@@ -1,0 +1,162 @@
+---
+title: "Post-Meeting Cost Summaries Based on Actual Attendance"
+sidebarTitle: "Meeting Summaries"
+description: "MeetCost produces meeting cost summaries from actual attendance and actual duration, not what was booked. Covers no-shows, late joins, and estimate-versus-actual comparison."
+---
+
+Scheduling-time estimates are built on assumptions: everyone invited will attend, for the full booked duration. Post-meeting summaries are built on facts. MeetCost receives a provider webhook after the meeting ends, reads the actual attendance report from your own tenant using the service's own credentials, prices every attendee against the minutes they were actually in the room, and stores the result. The summary you receive reflects what the meeting cost — not what it was scheduled to cost — including no-shows who were never in the room, participants who left early, and the minutes lost collectively to late joins.
+
+## How summaries are produced
+
+<Steps>
+  <Step title="Provider webhook arrives">
+    After a meeting ends, the calendar provider (Google Meet, Zoom, or Microsoft Teams) sends a webhook to MeetCost containing only a meeting ID. No cost figures are ever taken from the webhook body.
+  </Step>
+  <Step title="Attendance is fetched">
+    MeetCost reads the full attendance report from the provider using the service's own credentials. A forged webhook therefore results in one authenticated read against your own tenant and nothing else.
+  </Step>
+  <Step title="Actual cost is computed">
+    `rates.meeting_cost()` is called over the actual attended minutes for each participant. Participants are priced against the pay record in effect on the meeting date. No-shows cost nothing; early leavers and late joiners are costed for the minutes they were present.
+  </Step>
+  <Step title="Summary is stored and notified">
+    The result is stored against the meeting record and an email notification is dispatched using the `meeting_summary` template. Each recipient's copy is redacted independently for their role and the active disclosure policy.
+  </Step>
+</Steps>
+
+## Actual vs booked: what changes
+
+A meeting booked for 60 minutes with eight people is not necessarily a 60-minute eight-person meeting.
+
+| Signal | How it affects the cost |
+|---|---|
+| **No-show** | The person is in the attendance report with 0 minutes. They contribute nothing to the actual cost. |
+| **Early leaver** | Costed for the minutes they were present, not the full duration. |
+| **Late join** | `late_join_minutes` is recorded separately and included in the attendance total. |
+| **Meeting ran short** | `actual_minutes` is derived from `actual_end − actual_start`; if those timestamps are absent, it is the maximum of any individual's attended minutes. |
+
+The summary response includes `late_join_minutes` as a separate field so you can surface the total minutes lost to late starts as its own metric.
+
+## Retrieving a summary
+
+Two endpoint forms are available. Both return the same `MeetingSummaryResponse` body, redacted for the caller.
+
+<Tabs>
+  <Tab title="By MeetCost meeting ID">
+    ```bash
+    GET /api/v1/meetings/{meeting_id}/summary
+    ```
+
+    Use this form when your client stores the MeetCost-internal meeting ID.
+  </Tab>
+  <Tab title="By provider meeting ID">
+    ```bash
+    GET /api/v1/meetings/by-provider/{provider}/{provider_meeting_id}/summary
+    ```
+
+    Use this form with the ID the calendar client already has — the Google Meet, Zoom, or Teams meeting identifier.
+  </Tab>
+</Tabs>
+
+### Response shape
+
+```json
+{
+  "meeting_id": "01J9XZ...",
+  "provider": "google",
+  "title": "Weekly product sync",
+  "organiser_email": "ada@example.com",
+  "started_at": "2026-09-01T09:00:00Z",
+  "duration_minutes": "52",
+  "cost": {
+    "visible": true,
+    "total": "421.60",
+    "currency": "USD",
+    "headcount": 6,
+    "duration_minutes": "52",
+    "total_is_approximate": false,
+    "estimated_headcount": 0,
+    "participants": null,
+    "redactions": ["breakdown_disabled_by_policy"]
+  },
+  "estimated_total": "649.38",
+  "actual_vs_estimate": "-227.78",
+  "late_join_minutes": "14",
+  "annualised_total": "21923.20",
+  "coverage_note": null
+}
+```
+
+`actual_vs_estimate` is the signed difference between actual cost and the estimate that was recorded at scheduling time. A negative value means the meeting cost less than expected — fewer people showed up, or it ran short.
+
+<Note>
+`estimated_total` and `actual_vs_estimate` are only present when a scheduling-time estimate was recorded for this meeting. They are `null` for meetings ingested manually or for platforms that do not use the add-in.
+</Note>
+
+## Why 404 is a normal state
+
+The by-provider endpoint will return `404` during a meeting and for some time after it ends. Providers do not publish attendance data in real time — it typically becomes available minutes to hours after the meeting concludes.
+
+<Warning>
+A `404` from `GET /api/v1/meetings/by-provider/{provider}/{provider_meeting_id}/summary` during or shortly after a meeting is **not an error**. Display "not yet available" to the user, not an error state. Treating it as zero would be misleading.
+</Warning>
+
+## Role requirements
+
+Who can view a summary depends on the meeting and the viewer's role.
+
+| Viewer | Can see |
+|---|---|
+| Meeting organiser | Always — their own meeting |
+| Meeting participant | Own summary only (if `participants_see_cost` is enabled in policy) |
+| Team lead | Any meeting whose organiser is in their team |
+| Finance / Admin | Any meeting |
+
+A caller who was neither in the meeting nor its organiser and does not hold at least the `team_lead` role receives `403 Forbidden`.
+
+## Your own meetings list
+
+```bash
+GET /api/v1/meetings/mine
+```
+
+Returns the meetings the caller organised, most recent first. Each entry includes the summary cost view redacted for the caller.
+
+## Manually ingesting meetings
+
+For platforms MeetCost has no webhook collector for, you can push a completed meeting directly.
+
+```bash
+POST /api/v1/meetings/ingest
+```
+
+Requires an admin role or a service token. The request body mirrors the normalised attendance format:
+
+```json
+{
+  "provider": "webex",
+  "provider_meeting_id": "webex-meeting-xyz",
+  "attendance": [
+    { "email": "ada@example.com", "minutes": 55, "late_join_minutes": 5 },
+    { "email": "bola@example.com", "minutes": 55, "late_join_minutes": 0 },
+    { "email": "chen@example.com", "minutes": 0, "late_join_minutes": 0 }
+  ],
+  "title": "Quarterly planning",
+  "organiser_email": "ada@example.com",
+  "actual_start": "2026-09-01T13:00:00Z",
+  "actual_end":   "2026-09-01T13:55:00Z",
+  "scheduled_minutes": 60
+}
+```
+
+The endpoint is idempotent on `(provider, provider_meeting_id)`. Provider webhooks retry, and a retry must not double-count a meeting in the monthly report.
+
+## Email notification format
+
+After a meeting is processed, MeetCost sends each recipient a summary email using the `meeting_summary` template. Each recipient's email is redacted independently — a participant email shows only what that participant is permitted to see under the active disclosure policy, which may differ from what the organiser sees in their copy.
+
+The email includes:
+- Meeting title, date, and actual duration
+- Total actual cost (if visible to the recipient)
+- Comparison to the scheduled estimate, where available
+- Headcount and any `coverage_note` explaining fallback-rated attendees
+- A link to the full summary in the add-in

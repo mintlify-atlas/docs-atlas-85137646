@@ -1,0 +1,254 @@
+---
+title: "POST /api/v1/estimate — Meeting Cost Estimation"
+sidebarTitle: "/estimate"
+description: "POST /api/v1/estimate returns the payroll cost for a set of invitees. POST /api/v1/estimate/commit records that the organiser sent the invite."
+---
+
+The estimate endpoints are the scheduling-time surface of MeetCost. `POST /api/v1/estimate` is designed to be called on every meaningful edit to a calendar draft — changing the invitee list, adjusting the duration, switching from a one-off to a recurring meeting — and is deliberately a single round trip with no fan-out. `POST /api/v1/estimate/commit` closes the loop by recording that the organiser actually sent the invite, enabling the "reduced before send" metric that shows whether the nudges are working.
+
+---
+
+## POST /api/v1/estimate
+
+Estimate the payroll cost of a meeting that has not happened yet. Requires authentication; any authenticated role may call this endpoint.
+
+### Request body
+
+<ParamField body="invitees" type="string[]" required>
+  Email addresses of all meeting invitees, including the organiser. At most 500 addresses. Case differences are normalised and duplicates are collapsed before lookup, so sending `Ada@example.com` and `ada@example.com` counts as one person.
+</ParamField>
+
+<ParamField body="duration_minutes" type="number" required>
+  Planned duration in minutes. Must be greater than 0 and at most 1440 (24 hours).
+</ParamField>
+
+<ParamField body="cadence" type="string" default="one_off">
+  How often this meeting recurs. Drives `annualised_total` in the response.
+
+  | Value | Meaning |
+  |---|---|
+  | `one_off` | Single occurrence (default). `annualised_total` will be `null`. |
+  | `daily` | Every calendar day |
+  | `weekdaily` | Every working day (Monday–Friday) |
+  | `weekly` | Once a week |
+  | `biweekly` | Every two weeks |
+  | `monthly` | Once a month |
+  | `quarterly` | Once a quarter |
+</ParamField>
+
+<ParamField body="provider" type="string" default="unknown">
+  The calendar platform originating this estimate (`google`, `microsoft`, `zoom`). Used to tag snapshot records. Maximum 20 characters.
+</ParamField>
+
+<ParamField body="draft_id" type="string">
+  Client-generated identifier for the draft being edited. When provided, MeetCost links successive estimates for the same draft so the "reduced before send" metric can be computed. Omit it and nothing is recorded. Maximum 120 characters.
+</ParamField>
+
+<ParamField body="organiser_email" type="string">
+  Email of the meeting organiser. Defaults to the authenticated caller's email. Used to apply organiser-level disclosure rules.
+</ParamField>
+
+<ParamField body="meeting_date" type="string">
+  ISO 8601 date (`YYYY-MM-DD`) determining which pay records apply. Defaults to today. Use this to estimate a meeting scheduled for a future date when pay records may change.
+</ParamField>
+
+### Request example
+
+```json
+{
+  "invitees": ["ada@example.com", "bola@example.com", "cara@example.com"],
+  "duration_minutes": 60,
+  "cadence": "weekly",
+  "provider": "google",
+  "draft_id": "gcal-abc123",
+  "organiser_email": "ada@example.com",
+  "meeting_date": "2026-09-01"
+}
+```
+
+### Response body
+
+<ResponseField name="cost" type="object">
+  The cost result, subject to disclosure policy redaction.
+
+  <Expandable title="cost fields">
+    <ResponseField name="cost.visible" type="boolean">
+      `true` if the total is disclosed to this caller. `false` is not an error — it means policy withheld the figure. Always check this before reading `cost.total`.
+    </ResponseField>
+
+    <ResponseField name="cost.total" type="string | null">
+      Total payroll cost as a decimal string (e.g. `"649.38"`). `null` when `visible` is `false`. Parse with a decimal library.
+    </ResponseField>
+
+    <ResponseField name="cost.currency" type="string">
+      ISO 4217 currency code (e.g. `"USD"`). All invitees must be in the same currency; see the 409 note below.
+    </ResponseField>
+
+    <ResponseField name="cost.headcount" type="integer">
+      Number of invitees after deduplication. Always present regardless of redaction.
+    </ResponseField>
+
+    <ResponseField name="cost.duration_minutes" type="string">
+      Duration used for the calculation, as a decimal string. Always present.
+    </ResponseField>
+
+    <ResponseField name="cost.total_is_approximate" type="boolean">
+      `true` when `total_banded_small_meeting` redaction is active — the total has been rounded to two significant figures.
+    </ResponseField>
+
+    <ResponseField name="cost.estimated_headcount" type="integer">
+      Number of attendees priced at the org-wide fallback rate because they had no pay record. When non-zero, check `coverage_note` for an explanation suitable for the user.
+    </ResponseField>
+
+    <ResponseField name="cost.participants" type="array | null">
+      Per-person cost breakdown. `null` unless `per_person_breakdown_enabled` is `true` and the caller's role permits it. Each entry has `email`, `minutes`, `cost`, `rate_source`, and `is_estimate`.
+    </ResponseField>
+
+    <ResponseField name="cost.redactions" type="string[]">
+      List of redaction codes applied. May be empty. See the [redaction codes table](/api/overview#redaction-codes) for meanings.
+    </ResponseField>
+  </Expandable>
+</ResponseField>
+
+<ResponseField name="annualised_total" type="string | null">
+  The cost of this meeting over a full year at the given cadence, as a decimal string. `null` for `one_off` cadence, because an annualised figure for a one-time meeting would be meaningless.
+</ResponseField>
+
+<ResponseField name="cadence" type="string">
+  The cadence value from the request, echoed back.
+</ResponseField>
+
+<ResponseField name="nudges" type="array">
+  Zero or more nudge objects, each with `code`, `message`, and `threshold`. Nudges are triggered when cost, headcount, or duration exceeds the configured thresholds. Messages are safe to display directly to the organiser.
+
+  <Expandable title="nudge fields">
+    <ResponseField name="nudges[].code" type="string">
+      Machine-readable nudge type, e.g. `cost_above_threshold`, `annualised`.
+    </ResponseField>
+    <ResponseField name="nudges[].message" type="string">
+      Human-readable nudge text, e.g. `"At this cadence that is about USD 33,768 a year."`.
+    </ResponseField>
+    <ResponseField name="nudges[].threshold" type="string">
+      The rule that triggered the nudge, e.g. `"cost > USD 500"`.
+    </ResponseField>
+  </Expandable>
+</ResponseField>
+
+<ResponseField name="coverage_note" type="string | null">
+  A human-readable explanation when `estimated_headcount` is non-zero. Describes how many people were priced at the fallback rate and why the total may be understated. This message is especially prominent when no fallback rate has been configured, because those people contributed nothing to the total at all. Safe to show directly to the organiser. `null` when all invitees had pay records.
+</ResponseField>
+
+<ResponseField name="snapshot_id" type="string | null">
+  The ID of the snapshot record created for this estimate. Present only when `draft_id` was supplied and the cost was visible. `null` otherwise.
+</ResponseField>
+
+### Response example
+
+```json
+{
+  "cost": {
+    "visible": true,
+    "total": "649.38",
+    "currency": "USD",
+    "headcount": 8,
+    "duration_minutes": "60",
+    "total_is_approximate": false,
+    "estimated_headcount": 0,
+    "participants": null,
+    "redactions": ["breakdown_disabled_by_policy"]
+  },
+  "annualised_total": "33767.76",
+  "cadence": "weekly",
+  "nudges": [
+    {
+      "code": "cost_above_threshold",
+      "message": "This meeting costs more than the USD 500 threshold.",
+      "threshold": "cost > USD 500"
+    },
+    {
+      "code": "annualised",
+      "message": "At this cadence that is about USD 33,768 a year."
+    }
+  ],
+  "coverage_note": null,
+  "snapshot_id": "a1b2c3d4e5f6..."
+}
+```
+
+### 409 Conflict — mixed-currency invitees
+
+If the invitee list includes people whose pay records are in more than one currency, MeetCost returns `409 Conflict`. MeetCost v1 does not perform currency conversion. The error response describes which currencies collided:
+
+```json
+{
+  "detail": "Invitees hold pay records in multiple currencies: USD, GBP. MeetCost v1 does not convert currencies."
+}
+```
+
+<Tip>
+When you receive a 409, show the organiser a message explaining that the invitee list spans multiple salary currencies and that the estimate cannot be produced. This is not an error in your integration — it reflects a genuine limitation of the v1 rate engine.
+</Tip>
+
+### Coverage and fallback rates
+
+When `estimated_headcount` is greater than zero, some attendees had no pay record and were priced at the org-wide `fallback_annual_pay` rate. The `coverage_note` field contains a sentence you can show the organiser directly.
+
+<Warning>
+If the admin has not configured a fallback rate, `fallback_annual_pay` is `0`. In this case, every person without a pay record contributes nothing to the total, and `coverage_note` will say so explicitly. The total shown to the organiser is a genuine underestimate, not just a rounded one.
+</Warning>
+
+---
+
+## POST /api/v1/estimate/commit
+
+Mark a draft as sent, closing the measurement loop on the "reduced before send" metric. Call this when the organiser actually issues the calendar invitation — not when the estimate is first shown. Drafts that are never committed count as abandoned, which is itself a meaningful signal.
+
+Requires authentication. The caller must be the organiser who created the draft, or a service token. Returns `404` if the `draft_id` is not found.
+
+### Request body
+
+<ParamField body="draft_id" type="string" required>
+  The `draft_id` that was passed to `POST /api/v1/estimate` when the draft was created. Maximum 120 characters.
+</ParamField>
+
+### Request example
+
+```json
+{
+  "draft_id": "gcal-abc123"
+}
+```
+
+### Response body
+
+<ResponseField name="draft_id" type="string">
+  The committed draft ID, echoed back.
+</ResponseField>
+
+<ResponseField name="snapshots" type="integer">
+  Total number of estimate snapshots recorded for this draft — one per call to `POST /api/v1/estimate` with this `draft_id`.
+</ResponseField>
+
+<ResponseField name="initial_total" type="string">
+  The cost total from the first snapshot, as a decimal string.
+</ResponseField>
+
+<ResponseField name="final_total" type="string">
+  The cost total from the last snapshot before commit, as a decimal string.
+</ResponseField>
+
+<ResponseField name="reduced_before_send" type="boolean">
+  `true` if `final_total` is less than `initial_total`, meaning the organiser reduced the meeting cost (by removing invitees, shortening the duration, etc.) before sending.
+</ResponseField>
+
+### Response example
+
+```json
+{
+  "draft_id": "gcal-abc123",
+  "snapshots": 4,
+  "initial_total": "649.38",
+  "final_total": "324.69",
+  "reduced_before_send": true
+}
+```

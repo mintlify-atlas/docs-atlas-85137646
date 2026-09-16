@@ -1,0 +1,222 @@
+---
+title: "Reports and CSV Export API Endpoints"
+sidebarTitle: "/reports"
+description: "GET /api/v1/reports returns periodic cost reports scoped to the caller's role. GET /api/v1/reports/export.csv provides an aggregate CSV download."
+---
+
+The reports endpoints surface periodic meeting cost summaries — spend totals, recurring series run-rates, trend comparisons, and the "reduced before send" metric. The scope of what each caller can see is determined entirely by their role: there is no request parameter that widens it, and participants are excluded entirely. Both the JSON view and the CSV export are written to the audit log on every access.
+
+---
+
+## Role-to-scope mapping
+
+| Role | Report scope |
+|---|---|
+| `participant` | `403 Forbidden` — reports are not available |
+| `organiser` | `403 Forbidden` — the organiser role is per-meeting, not a standing reporting role |
+| `team_lead` | Meetings organised by their team only |
+| `finance` | Org-wide |
+| `admin` | Org-wide |
+
+<Note>
+Scope is derived server-side from the caller's role and team assignment. You cannot pass a `scope` parameter to widen it. A `team_lead` with `team_id=eng` will always see only the engineering team's meetings, even if they request something broader.
+</Note>
+
+---
+
+## GET /api/v1/reports
+
+Returns a digest for the most recent complete period (weekly or monthly). Callers with the `team_lead` role see their team's data; callers with `finance` or `admin` see org-wide data. Participants and organisers receive `403`.
+
+Both response views are recorded in the audit log.
+
+### Query parameters
+
+<ParamField query="period" type="string" default="weekly">
+  The reporting period. Must be `weekly` or `monthly`.
+</ParamField>
+
+<ParamField query="anchor" type="string">
+  An ISO 8601 date (`YYYY-MM-DD`). When provided, the report covers the complete period **before** this date rather than the most recent complete period. Use this to retrieve historical periods.
+
+  ```
+  GET /api/v1/reports?period=monthly&anchor=2026-09-01
+  # Returns the completed monthly period before September 1st — i.e. August.
+  ```
+</ParamField>
+
+### Response body
+
+<ResponseField name="period" type="string">
+  The period label, e.g. `"2026-W35"` or `"2026-08"`.
+</ResponseField>
+
+<ResponseField name="period_start" type="string">
+  ISO 8601 date of the first day of the period.
+</ResponseField>
+
+<ResponseField name="period_end" type="string">
+  ISO 8601 date of the last day of the period.
+</ResponseField>
+
+<ResponseField name="scope" type="string">
+  The scope actually applied to this report (`"team"` or `"org_wide"`), derived from the caller's role.
+</ResponseField>
+
+<ResponseField name="currency" type="string">
+  ISO 4217 currency code for all monetary figures in this response.
+</ResponseField>
+
+<ResponseField name="total_spend" type="string">
+  Total payroll cost of all meetings in the period, as a decimal string.
+</ResponseField>
+
+<ResponseField name="meeting_count" type="integer">
+  Number of completed meetings in the period.
+</ResponseField>
+
+<ResponseField name="person_hours" type="number">
+  Aggregate person-hours (sum of `attendees × duration_hours` for all meetings).
+</ResponseField>
+
+<ResponseField name="previous_total" type="string | null">
+  Total spend for the equivalent prior period. `null` if no data exists for that period.
+</ResponseField>
+
+<ResponseField name="change_percent" type="number | null">
+  Percentage change from `previous_total` to `total_spend`. Positive = increase. `null` if `previous_total` is unavailable.
+</ResponseField>
+
+<ResponseField name="by_team" type="array">
+  Spend broken down by team, for org-wide scoped reports.
+
+  <Expandable title="by_team item fields">
+    <ResponseField name="team_id" type="string | null">Team identifier.</ResponseField>
+    <ResponseField name="team_name" type="string | null">Display name of the team.</ResponseField>
+    <ResponseField name="meetings" type="integer">Number of meetings for this team.</ResponseField>
+    <ResponseField name="total" type="string">Total spend, as a decimal string.</ResponseField>
+  </Expandable>
+</ResponseField>
+
+<ResponseField name="by_series" type="array">
+  Spend broken down by recurring meeting series.
+
+  <Expandable title="by_series item fields">
+    <ResponseField name="series_id" type="string | null">Provider series identifier.</ResponseField>
+    <ResponseField name="title" type="string | null">Series title.</ResponseField>
+    <ResponseField name="occurrences" type="integer">Number of occurrences in the period.</ResponseField>
+    <ResponseField name="total" type="string">Total spend across all occurrences, as a decimal string.</ResponseField>
+    <ResponseField name="annualised" type="string | null">Annual run-rate based on cadence, as a decimal string. `null` for one-off meetings.</ResponseField>
+  </Expandable>
+</ResponseField>
+
+<ResponseField name="largest_meetings" type="array">
+  The highest-cost individual meetings in the period.
+
+  <Expandable title="largest_meetings item fields">
+    <ResponseField name="meeting_id" type="string">MeetCost internal meeting ID.</ResponseField>
+    <ResponseField name="title" type="string | null">Meeting title.</ResponseField>
+    <ResponseField name="started_at" type="string | null">Actual start datetime (ISO 8601).</ResponseField>
+    <ResponseField name="headcount" type="integer">Number of attendees.</ResponseField>
+    <ResponseField name="duration_minutes" type="number">Actual duration in minutes.</ResponseField>
+    <ResponseField name="total" type="string">Total cost, as a decimal string.</ResponseField>
+  </Expandable>
+</ResponseField>
+
+<ResponseField name="reduced_before_send" type="object | null">
+  The rollout metric showing whether organisers are acting on nudges. **Present only for org-wide scoped reports.** `null` for team-scoped reports.
+
+  <Expandable title="reduced_before_send fields">
+    <ResponseField name="drafts_with_revisions" type="integer">Number of drafts that were edited at least once before sending.</ResponseField>
+    <ResponseField name="reduced" type="integer">Drafts where the final estimate was lower than the first estimate.</ResponseField>
+    <ResponseField name="abandoned" type="integer">Drafts that were never committed (invite was not sent).</ResponseField>
+    <ResponseField name="reduced_percent" type="number">Percentage of revised drafts that were reduced.</ResponseField>
+    <ResponseField name="estimated_saving" type="string">Aggregate estimated cost reduction across all reduced drafts, as a decimal string.</ResponseField>
+  </Expandable>
+</ResponseField>
+
+### Response example
+
+```json
+{
+  "period": "2026-W35",
+  "period_start": "2026-08-24",
+  "period_end": "2026-08-30",
+  "scope": "org_wide",
+  "currency": "USD",
+  "total_spend": "18432.50",
+  "meeting_count": 147,
+  "person_hours": "612.5",
+  "previous_total": "16890.00",
+  "change_percent": 9.13,
+  "by_team": [
+    { "team_id": "eng", "team_name": "Engineering", "meetings": 52, "total": "7140.20" },
+    { "team_id": "sales", "team_name": "Sales", "meetings": 41, "total": "5210.80" }
+  ],
+  "by_series": [
+    {
+      "series_id": "rrule-xyz",
+      "title": "Weekly all-hands",
+      "occurrences": 1,
+      "total": "1840.00",
+      "annualised": "95680.00"
+    }
+  ],
+  "largest_meetings": [
+    {
+      "meeting_id": "d4e5f6...",
+      "title": "Q3 planning",
+      "started_at": "2026-08-26T13:00:00Z",
+      "headcount": 34,
+      "duration_minutes": "120",
+      "total": "3210.40"
+    }
+  ],
+  "reduced_before_send": {
+    "drafts_with_revisions": 23,
+    "reduced": 14,
+    "abandoned": 5,
+    "reduced_percent": 60.87,
+    "estimated_saving": "2140.00"
+  }
+}
+```
+
+### Example request
+
+```bash
+curl "https://meetcost.acme-corp.internal/api/v1/reports?period=monthly&anchor=2026-09-01" \
+  -H "Authorization: Bearer <token>"
+```
+
+---
+
+## GET /api/v1/reports/export.csv
+
+Downloads an aggregate CSV of the same report data. Same scope and auth rules as the JSON endpoint. The CSV is **aggregate-only**: no column identifies an individual person's cost, salary, or rate. Heavily audited — every export creates one audit event per actor.
+
+**Admin only.** Finance and team_lead roles can view the JSON report but cannot download the CSV export.
+
+### Query parameters
+
+Same as `GET /api/v1/reports`: `period` (`weekly`|`monthly`) and optional `anchor` (`YYYY-MM-DD`).
+
+### Response
+
+Returns `text/csv` with a `Content-Disposition: attachment` header. The filename includes the period label and start date, e.g.:
+
+```
+Content-Disposition: attachment; filename="meetcost-2026-W35-2026-08-24.csv"
+```
+
+### Example request
+
+```bash
+curl "https://meetcost.acme-corp.internal/api/v1/reports/export.csv?period=weekly" \
+  -H "Authorization: Bearer <admin-token>" \
+  -o meetcost-report.csv
+```
+
+<Warning>
+Every call to the CSV export writes an audit record. Automated scripts that call this endpoint repeatedly will produce a proportionally large audit trail. Schedule exports thoughtfully — a weekly download is typically sufficient for most compliance workflows.
+</Warning>

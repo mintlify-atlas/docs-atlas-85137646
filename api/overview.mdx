@@ -1,0 +1,119 @@
+---
+title: "MeetCost HTTP API Overview"
+sidebarTitle: "Overview"
+description: "Overview of the MeetCost REST API: base URL, versioning, content types, money encoding, redaction semantics, and error conventions."
+---
+
+MeetCost exposes a versioned REST API that every client — the Google Meet add-on, the Zoom app, the Teams tab, and your own tooling — talks to. The full interactive reference is available at `/docs` on any running deployment, and the OpenAPI document is at `/openapi.json`. This page covers the conventions and invariants that the schema alone cannot express: why money is a string, what it means when `cost.visible` is `false`, and what the health endpoints tell you about the deployment's readiness.
+
+## Base URL
+
+```
+https://your-meetcost-domain/api/v1/
+```
+
+All versioned endpoints are prefixed with `/api/v1/`. The two health endpoints (`/healthz`, `/readyz`) and the webhook receivers (`/webhooks/...`) live outside this prefix.
+
+## Content type
+
+All request and response bodies use `application/json`. Requests with a body must set `Content-Type: application/json`.
+
+## Money is always a string
+
+Monetary amounts cross the wire as strings — `"649.38"`, not `649.38`. A JSON number is an IEEE-754 double-precision float, which cannot represent values like `1234.56` exactly. Because these figures end up in finance reports, MeetCost serialises every amount as a decimal string. Parse them with a decimal library, not a float.
+
+```json
+{
+  "cost": {
+    "total": "649.38",
+    "currency": "USD"
+  }
+}
+```
+
+This applies to every money field across every endpoint: `total`, `annualised_total`, `initial_total`, `final_total`, `estimated_saving`, and all report totals.
+
+## Redaction is not an error
+
+Every cost response carries a `cost.visible` flag. When `visible` is `false`, the deployment's disclosure policy withheld the total from *this* caller — a normal, expected outcome, not a failure condition. The `redactions` array tells you which rule applied.
+
+```json
+{
+  "cost": {
+    "visible": false,
+    "headcount": 8,
+    "duration_minutes": "60",
+    "total": null,
+    "redactions": ["total_not_visible_to_participants"]
+  }
+}
+```
+
+Headcount and duration are always present even when cost is withheld — both are already on the calendar invitation. A client **must** render the withheld case gracefully rather than treating it as an error, and must never infer a total from other fields in the payload. Redaction happens server-side so that a compromised client has nothing to leak.
+
+### Redaction codes
+
+| Code | Meaning |
+|---|---|
+| `total_not_visible_to_participants` | Organiser-only policy (default). Participants see headcount and duration but not the total. |
+| `total_banded_small_meeting` | The total has been rounded to two significant figures. `total_is_approximate` will be `true`. |
+| `breakdown_withheld_small_meeting` | The meeting is below the suppression threshold; per-person breakdown is not available. |
+| `breakdown_disabled_by_policy` | Per-person figures have been switched off org-wide by an admin. |
+| `breakdown_not_permitted_for_role` | Participants never see a per-person breakdown, regardless of other policy settings. |
+
+## Health and bootstrap endpoints
+
+These endpoints require no authentication.
+
+<CardGroup cols={3}>
+  <Card title="GET /healthz" icon="heart-pulse">
+    Liveness probe. Returns `{"status": "ok", "version": "..."}`. A load balancer should route to instances where this returns 200.
+  </Card>
+  <Card title="GET /readyz" icon="database">
+    Readiness probe. Touches the database, reports the active egress allowlist, and confirms whether the encryption key is configured. Use this for startup and rolling-update gates.
+  </Card>
+  <Card title="GET /api/v1/client-config" icon="gear">
+    Bootstrap payload for add-in clients. Requires authentication. Returns the org's currency, nudge thresholds, the caller's role, and the service version — nothing about pay data.
+  </Card>
+</CardGroup>
+
+A sample `/readyz` response:
+
+```json
+{
+  "status": "ready",
+  "version": "1.0.0",
+  "database": "ok",
+  "encryption_key_configured": true,
+  "egress_allowlist": ["admin.googleapis.com", "graph.microsoft.com"],
+  "egress_enforced": true
+}
+```
+
+<Note>
+`/api/v1/client-config` deliberately contains nothing about pay data. A compromised add-in client learns the org's nudge thresholds and nothing else.
+</Note>
+
+## Error responses
+
+All errors follow the standard FastAPI/Starlette error shape:
+
+```json
+{
+  "detail": "A human-readable description of what went wrong."
+}
+```
+
+| HTTP status | When it occurs |
+|---|---|
+| `400 Bad Request` | Malformed JSON body or an invalid query parameter. |
+| `401 Unauthorized` | Missing or invalid bearer token. The `WWW-Authenticate: Bearer` header is set. |
+| `403 Forbidden` | Valid token, but the caller's role does not permit this action. |
+| `404 Not Found` | The resource does not exist — or, for meeting summaries, the provider has not published attendance data yet. |
+| `409 Conflict` | Invitees hold pay records in more than one currency; MeetCost v1 does not convert. |
+| `413 Request Entity Too Large` | Request body or invitee list exceeds the configured limit. |
+| `503 Service Unavailable` | A required integration (e.g. `MEETCOST_ZOOM_WEBHOOK_SECRET`) is not configured. |
+
+## Authentication
+
+See [Authentication](/api/authentication) for how to obtain and pass a bearer token.

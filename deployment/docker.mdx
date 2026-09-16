@@ -1,0 +1,265 @@
+---
+title: "Deploy MeetCost with Docker Compose"
+sidebarTitle: "Docker"
+description: "Run MeetCost with Docker Compose for local trials and production deployments. Covers environment setup, database, TLS, and upgrading."
+---
+
+Docker Compose is the fastest way to get MeetCost running. The bundled `docker-compose.yml` starts Postgres and the service together with a single command, and the built-in healthcheck ensures the application never starts before the database is ready. The compose file is designed for local trials and proof-of-concept work — if you want a production-grade deployment with rolling updates, resource limits, and network policies, use the [Helm chart](/deployment/kubernetes) instead. If you do choose to run Compose in production, this page covers the minimum changes required to do so safely.
+
+## Production checklist
+
+Before you expose MeetCost to real users, verify each of the following. The first five are enforced at startup — MeetCost refuses to serve traffic if any of them are wrong.
+
+<Steps>
+  <Step title="Set MEETCOST_ENVIRONMENT=production">
+    Switches the service into production mode, which activates all startup guards and disables development-only commands such as `meetcost token` and `seed-demo`.
+  </Step>
+  <Step title="Supply MEETCOST_ENCRYPTION_KEY from your secret manager">
+    Every pay figure is encrypted with this key using AES-256-GCM. Generate it with `meetcost genkey` (see below), store it in your secret manager, and never commit it to git. Without the key, pay data is unreadable — losing it means losing the data.
+  </Step>
+  <Step title="Change MEETCOST_SECRET_KEY from its default">
+    Signs admin sessions and other internal tokens. Set it to a random 48-byte base64 string: `openssl rand -base64 48`.
+  </Step>
+  <Step title="Set MEETCOST_AUTH_MODE=oidc with MEETCOST_OIDC_ISSUER">
+    Development auth (`dev` mode) signs tokens locally and is rejected when `environment=production`. Configure OIDC against your identity provider — see the [Identity guide](/deployment/identity) for details.
+  </Step>
+  <Step title="Ensure MEETCOST_ENFORCE_EGRESS_ALLOWLIST=true">
+    This is the default. MeetCost allows outbound connections only to hosts derived from your configuration. Set it to `false` only to debug, and never leave it off in production.
+  </Step>
+  <Step title="Use Postgres, not SQLite">
+    SQLite is the default for trials. Money columns are float-backed in SQLite, so long-running aggregates can drift by fractions of a cent. Postgres 14 or newer is required for production.
+  </Step>
+  <Step title="Terminate TLS in front of the service">
+    MeetCost binds to `0.0.0.0:8000` and speaks plain HTTP. Put a reverse proxy (nginx, Caddy, Traefik) or a load balancer in front that handles TLS termination and redirects HTTP to HTTPS.
+  </Step>
+  <Step title="Set MEETCOST_FALLBACK_ANNUAL_PAY to a real number">
+    Anyone without a pay record is priced at this figure. Leaving it at zero means uncovered people cost nothing and every meeting estimate will be silently understated. MeetCost shows a warning on screen, but set a real blended rate.
+  </Step>
+  <Step title="Schedule digests outside the process">
+    Do not rely on background threads for digest delivery. A thread that dies quietly produces missing reports that nobody notices. Use the `scheduled` compose profile (or, better, Kubernetes CronJobs) to run `meetcost digest` as a separate process.
+  </Step>
+  <Step title="Back up the database and encryption key — separately">
+    Together they constitute a payroll file. Backed up to the same place, they offer no protection. Back up the database to one location and the encryption key to a different one (your secret manager). Test your restore procedure.
+  </Step>
+</Steps>
+
+## The docker-compose.yml
+
+The bundled compose file defines two services: `postgres` and `meetcost`.
+
+```yaml
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: meetcost
+      POSTGRES_PASSWORD: meetcost-local-only
+      POSTGRES_DB: meetcost
+    volumes:
+      - meetcost-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U meetcost"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    expose:
+      - "5432"
+
+  meetcost:
+    build: .
+    depends_on:
+      postgres:
+        condition: service_healthy
+    env_file:
+      - .env
+    environment:
+      MEETCOST_ENVIRONMENT: development
+      MEETCOST_AUTH_MODE: dev
+      MEETCOST_DATABASE_URL: postgresql+psycopg://meetcost:meetcost-local-only@postgres:5432/meetcost
+      MEETCOST_PUBLIC_BASE_URL: http://localhost:8000
+      MEETCOST_SERVE_CLIENTS_PATH: /app/clients
+    ports:
+      - "127.0.0.1:8000:8000"
+    restart: unless-stopped
+```
+
+A few things to note:
+
+- **Postgres is not published to the host.** It uses `expose` rather than `ports`, so it is only reachable within the compose network. Nothing outside the network can connect to the database directly.
+- **Development mode is hardcoded.** `MEETCOST_ENVIRONMENT: development` and `MEETCOST_AUTH_MODE: dev` are set directly in the compose file. To use this file for production you must override both.
+- **`env_file: .env`** is loaded before the inline `environment` block, so the inline values win. Put your secrets in `.env` and leave the compose file untouched.
+- **The service binds only to loopback** (`127.0.0.1:8000:8000`). This means it is not accessible from other machines on your network without a reverse proxy.
+
+### The `scheduled` profile
+
+A `digest` service is included but only starts if you opt in:
+
+```bash
+docker compose --profile scheduled up -d
+```
+
+This runs `meetcost digest --period weekly` on a loop with a 24-hour sleep. It is adequate for a trial. For production, run the digest as a proper CronJob so failures are visible.
+
+## Environment variables before first boot
+
+Copy the example file and fill in the required values:
+
+```bash
+cp .env.example .env
+```
+
+At minimum, before the first `docker compose up`:
+
+| Variable | What to set |
+|---|---|
+| `MEETCOST_ENCRYPTION_KEY` | Output of `meetcost genkey` (see below) |
+| `MEETCOST_SECRET_KEY` | `openssl rand -base64 48` |
+| `MEETCOST_OIDC_ISSUER` | Your identity provider's issuer URL |
+| `MEETCOST_OIDC_AUDIENCE` | Your OAuth application's client ID |
+
+See the [Configuration reference](/deployment/configuration) for the full list.
+
+## Generating the encryption key
+
+The encryption key is a base64-encoded 32-byte value. Generate it with the built-in CLI command:
+
+```bash
+docker compose run --rm meetcost genkey
+```
+
+This prints one line to stdout. Copy it into your `.env` file:
+
+```bash
+MEETCOST_ENCRYPTION_KEY=<paste here>
+```
+
+<Warning>
+  Never commit the encryption key to git or include it in a Docker image. Every pay figure is encrypted with it. Losing the key means losing access to all pay data. Store it in a secret manager (AWS Secrets Manager, GCP Secret Manager, HashiCorp Vault, etc.) and inject it at runtime.
+</Warning>
+
+You can also generate the key outside of Docker if the image is not yet built:
+
+```bash
+docker run --rm ghcr.io/meetcost/meetcost genkey
+```
+
+Or locally via Make if you have a Python environment:
+
+```bash
+make key
+```
+
+## Quick start (local trial)
+
+```bash
+cp .env.example .env
+docker compose run --rm meetcost genkey   # paste output into MEETCOST_ENCRYPTION_KEY in .env
+docker compose up -d
+docker compose exec meetcost meetcost seed-demo
+```
+
+Then open [http://localhost:8000/admin](http://localhost:8000/admin). The demo dataset includes 8 people, pay records, and 4 completed meetings.
+
+<Note>
+  `seed-demo` is refused when `MEETCOST_ENVIRONMENT=production`. It exists only to populate the quickstart with realistic numbers.
+</Note>
+
+## Switching to Postgres for production
+
+The compose file already uses Postgres. The hardcoded password `meetcost-local-only` must be changed before production use. Either:
+
+1. Update the password in both the `postgres` service environment and the `MEETCOST_DATABASE_URL`, or
+2. Remove the bundled Postgres service and point `MEETCOST_DATABASE_URL` at an external managed database.
+
+To provision the database manually:
+
+```sql
+CREATE DATABASE meetcost;
+CREATE USER meetcost WITH PASSWORD 'your-strong-password';
+GRANT ALL PRIVILEGES ON DATABASE meetcost TO meetcost;
+```
+
+Tables are created automatically at first boot — no migration command is needed for v0.1.
+
+The full SQLAlchemy URL format:
+
+```
+postgresql+psycopg://meetcost:PASSWORD@hostname:5432/meetcost
+```
+
+<Tip>
+  Encrypt the Postgres volume as well. Field-level encryption protects pay amounts, but names, teams, and meeting titles are stored in plaintext because they already exist in your calendar system. Disk encryption covers those fields.
+</Tip>
+
+## TLS termination
+
+MeetCost speaks plain HTTP on port 8000. For production, terminate TLS in front of the service. A minimal nginx snippet:
+
+```nginx
+server {
+    listen 443 ssl;
+    server_name meetcost.your-company.example;
+
+    ssl_certificate     /etc/ssl/certs/meetcost.crt;
+    ssl_certificate_key /etc/ssl/private/meetcost.key;
+
+    location / {
+        proxy_pass         http://127.0.0.1:8000;
+        proxy_set_header   Host $host;
+        proxy_set_header   X-Real-IP $remote_addr;
+        proxy_set_header   X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header   X-Forwarded-Proto $scheme;
+    }
+}
+
+server {
+    listen 80;
+    server_name meetcost.your-company.example;
+    return 301 https://$host$request_uri;
+}
+```
+
+## Observability endpoints
+
+| Endpoint | Purpose |
+|---|---|
+| `/healthz` | Liveness probe. No dependencies — returns 200 if the process is alive. |
+| `/readyz` | Readiness probe. Touches the database and reports the active egress allowlist. Returns non-200 if the database is unreachable. |
+
+The Docker image configures a `HEALTHCHECK` against `/readyz`:
+
+```dockerfile
+HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
+    CMD curl -fsS http://127.0.0.1:8000/readyz || exit 1
+```
+
+Logs are structured text written to stdout. No pay figures appear in logs — the audit log records that a value was accessed, never the value itself.
+
+## Upgrading
+
+Pull the new image and restart:
+
+```bash
+docker compose pull
+docker compose up -d
+```
+
+<Warning>
+  Back up the database before upgrading. Also verify that your encryption key backup is stored separately from the database dump — together they are a payroll file, and separately neither is useful to an attacker.
+</Warning>
+
+Tables are updated on first boot if the schema has changed.
+
+## Uninstalling
+
+```bash
+docker compose down
+```
+
+The named volume `meetcost-data` persists by default. To remove it:
+
+```bash
+docker compose down --volumes
+```
+
+If you are fully decommissioning, drop the database tables and destroy the encryption key. Without the key, pay data is already unreadable — destroying it is a belt-and-braces erasure step.

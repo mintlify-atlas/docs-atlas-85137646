@@ -1,0 +1,259 @@
+---
+title: "Deploy MeetCost on Kubernetes with Helm"
+sidebarTitle: "Kubernetes"
+description: "Install MeetCost on Kubernetes using the bundled Helm chart. Covers secrets, ingress, NetworkPolicy, CronJobs, and upgrade procedures."
+---
+
+The bundled Helm chart at `deploy/helm/meetcost` is the recommended way to run MeetCost in production. It is opinionated on the things that make MeetCost's data-residency guarantee concrete: the egress `NetworkPolicy` is on by default, the pod runs as a non-root user with a read-only root filesystem, secrets are referenced from a Kubernetes secret rather than templated into a `ConfigMap`, and all scheduled work runs as `CronJob` resources rather than background threads. Two replicas and a `PodDisruptionBudget` are included out of the box.
+
+## Prerequisites
+
+- Kubernetes 1.26 or newer
+- Helm 3.12 or newer
+- An ingress controller (the default configuration expects `nginx`)
+- A Postgres 14+ database reachable from within the cluster
+- `kubectl` configured to point at your target cluster
+
+## Step-by-step installation
+
+<Steps>
+  <Step title="Create the namespace">
+    ```bash
+    kubectl create namespace meetcost
+    ```
+  </Step>
+
+  <Step title="Create the secret">
+    MeetCost needs three values that must never appear in a `ConfigMap`: the encryption key, the session signing key, and the database URL. Create a Kubernetes secret to hold them:
+
+    ```bash
+    kubectl -n meetcost create secret generic meetcost-secrets \
+      --from-literal=encryptionKey="$(docker run --rm ghcr.io/meetcost/meetcost genkey)" \
+      --from-literal=secretKey="$(openssl rand -base64 48)" \
+      --from-literal=databaseUrl="postgresql+psycopg://meetcost:PASSWORD@postgres:5432/meetcost"
+    ```
+
+    The chart references this secret by name (`meetcost-secrets`) and mounts the values as environment variables. It never templates a secret value into a `ConfigMap`.
+
+    <Warning>
+      Replace `PASSWORD` with your actual Postgres password. The encryption key is generated fresh by the `genkey` command — it is printed to stdout and captured directly into the secret, so it is never written to disk or a shell history.
+    </Warning>
+  </Step>
+
+  <Step title="Install the chart">
+    ```bash
+    helm install meetcost deploy/helm/meetcost \
+      --namespace meetcost \
+      --set ingress.host=meetcost.your-company.example \
+      --set config.oidcIssuer=https://accounts.google.com \
+      --set config.oidcAudience=YOUR_CLIENT_ID \
+      --set config.bootstrapAdmins=you@your-company.example
+    ```
+
+    Replace `ingress.host`, `config.oidcIssuer`, `config.oidcAudience`, and `config.bootstrapAdmins` with values for your environment. See the [Identity guide](/deployment/identity) for the correct `oidcIssuer` for your identity provider.
+  </Step>
+
+  <Step title="Verify the deployment">
+    ```bash
+    kubectl -n meetcost get pods
+    kubectl -n meetcost get ingress
+    ```
+
+    Wait for both pods to show `Running` and `1/1` ready. The readiness probe checks `/readyz` which touches the database, so a pod that cannot reach Postgres will stay `0/1`.
+  </Step>
+</Steps>
+
+## Key values.yaml settings
+
+The chart ships with a fully documented `values.yaml`. The most important settings to review before going live:
+
+<CardGroup cols={2}>
+  <Card title="ingress.host" icon="globe">
+    The public hostname for MeetCost. TLS is enabled by default; the chart expects a secret named `meetcost-tls` in the same namespace, or you can override `ingress.tls.secretName`.
+  </Card>
+  <Card title="config.oidcIssuer" icon="key">
+    The OIDC issuer URL for your identity provider. MeetCost uses OIDC discovery to fetch JWKS automatically from `<issuer>/.well-known/openid-configuration`.
+  </Card>
+  <Card title="config.oidcAudience" icon="shield">
+    The client ID (audience) that tokens must be issued for. For Google this is your OAuth app's client ID; for Entra it is your application (client) ID.
+  </Card>
+  <Card title="config.bootstrapAdmins" icon="user-shield">
+    Comma-separated email addresses granted the `admin` role at first boot, before any role rows exist in the database. After the first admin logs in, use `meetcost grant` or the admin UI to manage roles.
+  </Card>
+</CardGroup>
+
+Other settings that commonly need attention:
+
+```yaml
+config:
+  fallbackAnnualPay: "85000"       # Anyone without a pay record is priced at this figure
+  loadingFactor: "1.30"            # Fully-loaded cost multiplier (salary × loadingFactor)
+  workingHoursPerYear: 2080        # Used to convert annual pay to an hourly rate
+  baseCurrency: USD                # ISO 4217 currency code
+
+  nudgeCostThreshold: "500"        # Warn organiser if meeting cost exceeds this (in baseCurrency)
+  nudgeHeadcountThreshold: 8       # Warn if attendee count exceeds this
+  nudgeDurationMinutesThreshold: 60  # Warn if scheduled duration exceeds this
+```
+
+See the [Configuration reference](/deployment/configuration) for the complete list of settings and their environment variable equivalents.
+
+## Secrets from an external secret manager
+
+If you use an external secret manager (AWS Secrets Manager, GCP Secret Manager, HashiCorp Vault), create the Kubernetes secret via your preferred operator (External Secrets Operator, Vault Agent Injector, etc.) and point the chart at it:
+
+```yaml
+secrets:
+  existingSecret: meetcost-secrets   # the name of your pre-existing secret
+  keys:
+    encryptionKey: encryptionKey     # key name within the secret
+    secretKey: secretKey
+    databaseUrl: databaseUrl
+```
+
+Provider credentials (Zoom client secret, HRIS API key, etc.) can be mounted as additional environment variables:
+
+```yaml
+extraSecretEnv:
+  MEETCOST_ZOOM_CLIENT_SECRET: zoomClientSecret
+  MEETCOST_HRIS_API_KEY: hrisApiKey
+```
+
+## NetworkPolicy: defence in depth
+
+The chart ships a `NetworkPolicy` that restricts egress at the cluster level to the same set of destinations the application allows itself. It is enabled by default (`networkPolicy.enabled: true`).
+
+```yaml
+networkPolicy:
+  enabled: true
+  databasePort: 5432      # Narrow this to your Postgres pod selector
+  allowDns: true          # DNS must be permitted or nothing resolves
+  allowHttpsEgress: true  # Permits port 443 outbound for tenant APIs (Google, Microsoft, Zoom)
+  extraEgress: []
+```
+
+The application-level egress guard and the `NetworkPolicy` are **independent** controls:
+
+- The application guard is a code-level promise: the service refuses to open connections to unconfigured hosts.
+- The `NetworkPolicy` is enforced by the cluster regardless of what the application code does.
+
+Keep both in place. If you use an HTTP proxy or an egress gateway:
+
+1. Add its hostname to `config.allowedEgressHosts` so the application allows the connection.
+2. Add it to `networkPolicy.extraEgress` so the cluster allows the packet.
+
+If you add it to only one place, requests will be blocked by the other. For example:
+
+```yaml
+config:
+  allowedEgressHosts: "squid-proxy.internal.example"
+
+networkPolicy:
+  extraEgress:
+    - ports:
+        - port: 3128
+          protocol: TCP
+      to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: proxy
+```
+
+## CronJobs
+
+Scheduled work is deliberately run as Kubernetes `CronJob` resources rather than background threads. A background thread that dies quietly produces a missing report nobody notices. The chart defines five CronJobs:
+
+| CronJob | Schedule | Command | Enabled by default |
+|---|---|---|---|
+| `digestWeekly` | `0 8 * * 1` | `meetcost digest --period weekly` | ✅ Yes |
+| `digestMonthly` | `0 8 1 * *` | `meetcost digest --period monthly` | ✅ Yes |
+| `collectGoogle` | `0 * * * *` | `meetcost collect google --hours 3` | ❌ No |
+| `syncDirectory` | `0 2 * * *` | `meetcost sync-directory` | ❌ No |
+| `syncHris` | `0 3 * * 1` | `meetcost sync-hris` | ❌ No |
+
+Enable the ones you need:
+
+```yaml
+cronJobs:
+  digestWeekly:
+    enabled: true
+    schedule: "0 8 * * 1"
+  digestMonthly:
+    enabled: true
+    schedule: "0 8 1 * *"
+  collectGoogle:
+    enabled: true              # Enable if you use Google Meet
+    schedule: "0 * * * *"
+  syncDirectory:
+    enabled: true              # Enable to keep the employee directory current
+    schedule: "0 2 * * *"
+  syncHris:
+    enabled: true              # Enable if you have an HRIS configured
+    schedule: "0 3 * * 1"
+```
+
+### Notes on attendance collection
+
+Google Meet has no end-of-meeting webhook, so attendance is polled via the Reports API. The `collectGoogle` CronJob runs hourly with a three-hour lookback window (`--hours 3`). The overlapping window is intentional — the Reports API is eventually consistent, and ingest is idempotent on `(provider, provider_meeting_id)`, so re-reading is free.
+
+Zoom and Microsoft deliver attendance via webhooks at `POST /webhooks/zoom` and `POST /webhooks/microsoft`. Both endpoints verify the provider's signature before taking any action.
+
+## Resource limits and autoscaling
+
+The default resource requests and limits:
+
+```yaml
+resources:
+  requests:
+    cpu: 100m
+    memory: 256Mi
+  limits:
+    cpu: 1000m
+    memory: 512Mi
+```
+
+Horizontal autoscaling is off by default. Enable it if you expect significant concurrent usage:
+
+```yaml
+autoscaling:
+  enabled: true
+  minReplicas: 2
+  maxReplicas: 6
+  targetCPUUtilizationPercentage: 70
+```
+
+A `PodDisruptionBudget` with `minAvailable: 1` ensures at least one pod remains available during cluster maintenance.
+
+## Upgrading
+
+Back up the database before every upgrade, and ensure the encryption key backup is stored separately from the database dump.
+
+```bash
+helm upgrade meetcost deploy/helm/meetcost --namespace meetcost
+```
+
+If you need to change values at upgrade time:
+
+```bash
+helm upgrade meetcost deploy/helm/meetcost \
+  --namespace meetcost \
+  --set config.fallbackAnnualPay=90000
+```
+
+Tables are updated on first boot after an upgrade if the schema has changed.
+
+## Uninstalling
+
+```bash
+helm uninstall meetcost --namespace meetcost
+```
+
+<Warning>
+  The database is not deleted by `helm uninstall`. If you are fully decommissioning MeetCost, connect to your Postgres instance and drop the database manually. Then destroy the encryption key — without the key, pay data is already unreadable, and destroying the key is a belt-and-braces erasure step alongside dropping the tables.
+</Warning>
+
+To remove the namespace as well:
+
+```bash
+kubectl delete namespace meetcost
+```

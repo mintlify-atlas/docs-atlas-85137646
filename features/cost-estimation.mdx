@@ -1,0 +1,192 @@
+---
+title: "Real-Time Meeting Cost Estimation at Scheduling Time"
+sidebarTitle: "Cost Estimation"
+description: "MeetCost estimates the payroll cost of a meeting as you build the invite list, including annualised totals for recurring meetings and configurable nudge prompts."
+---
+
+The moment a meeting cost becomes visible is the moment a behaviour change is still possible — before the invite goes out. MeetCost's estimation surface is designed around exactly this window: every edit to the invite list triggers a fresh cost calculation in a single round trip, the result updates inline in your calendar add-in, and for recurring meetings the annualised figure appears alongside the per-occurrence cost. An eight-person weekly sync that looks like a free hour on the calendar resolves to roughly £40,000 a year of payroll. Nobody can act on a number they cannot see; this is how they see it.
+
+## How the estimate is calculated
+
+The rate engine in `rates.py` is pure functions with no I/O. Every figure shown in the product is produced by two formulae:
+
+```
+cost_per_minute(person) = (annual_pay × loading_factor) / (working_hours_per_year × 60)
+meeting_cost            = Σ cost_per_minute(person) × duration_minutes
+```
+
+At scheduling time every invited person is assumed to attend for the full booked duration. The service resolves each invitee's pay record in effect on `meeting_date`, sums the per-minute costs, and applies the configured `loading_factor` (default `1.30`) to account for employer costs on top of base salary.
+
+<Note>
+**Money crosses the wire as a string, not a float.** A JSON number is an IEEE-754 double, which cannot represent amounts like `1234.56` exactly, and these figures end up in finance reports. Always parse them as decimals on the client side.
+</Note>
+
+## Calling the endpoint
+
+`POST /api/v1/estimate` is called on every edit to a draft invite list — one round trip, two database queries, no fan-out to external services.
+
+### Request fields
+
+| Field | Type | Required | Notes |
+|---|---|---|---|
+| `invitees` | `string[]` | Yes | Email addresses including the organiser. Duplicates and case differences are collapsed. Max 500. |
+| `duration_minutes` | `number` | Yes | `> 0`, max `1440` |
+| `cadence` | `string` | No | `one_off` (default), `daily`, `weekdaily`, `weekly`, `biweekly`, `monthly`, `quarterly` |
+| `provider` | `string` | No | `google`, `zoom`, `microsoft`, or `unknown` |
+| `draft_id` | `string` | No | Client-generated. Links successive estimates for the same draft. See [draft workflow](#the-draft_id-workflow). |
+| `organiser_email` | `string` | No | Used to attribute snapshots. |
+| `meeting_date` | `date` | No | Determines which pay records apply. Defaults to today. |
+
+<Tabs>
+  <Tab title="curl">
+    ```bash
+    TOKEN=$(meetcost token ada@example.com)
+
+    curl -s localhost:8000/api/v1/estimate \
+      -H "Authorization: Bearer $TOKEN" \
+      -H 'Content-Type: application/json' \
+      -d '{
+        "invitees": [
+          "ada@example.com", "bola@example.com", "chen@example.com",
+          "dia@example.com", "emeka@example.com", "fatima@example.com",
+          "gus@example.com", "hana@example.com"
+        ],
+        "duration_minutes": 60,
+        "cadence": "weekly"
+      }' | jq
+    ```
+  </Tab>
+  <Tab title="Response">
+    ```json
+    {
+      "cost": {
+        "visible": true,
+        "total": "649.38",
+        "currency": "USD",
+        "headcount": 8,
+        "duration_minutes": "60",
+        "total_is_approximate": false,
+        "estimated_headcount": 0,
+        "participants": null,
+        "redactions": ["breakdown_disabled_by_policy"]
+      },
+      "annualised_total": "33767.76",
+      "cadence": "weekly",
+      "nudges": [
+        {
+          "code": "cost_above_threshold",
+          "message": "This meeting costs about USD 649. Could a written update do the same job?",
+          "threshold": "cost > USD 500"
+        },
+        {
+          "code": "annualised",
+          "message": "At this cadence that is about USD 33,768 a year.",
+          "threshold": "cadence = weekly"
+        }
+      ],
+      "coverage_note": null,
+      "snapshot_id": "a1b2c3…"
+    }
+    ```
+  </Tab>
+</Tabs>
+
+## Cadence and the annualised total
+
+The `cadence` field drives `annualised_total`. For a `one_off` meeting `annualised_total` is always `null` — an annual figure for a meeting that happens once would be meaningless. For every other cadence, MeetCost multiplies the per-occurrence cost by the occurrences-per-year for that cadence:
+
+| Cadence | Occurrences per year |
+|---|---|
+| `daily` | 365 |
+| `weekdaily` | 260 (52 × 5 working days) |
+| `weekly` | 52 |
+| `biweekly` | 26 |
+| `monthly` | 12 |
+| `quarterly` | 4 |
+
+The annualised figure is computed from the same per-occurrence total the organiser is already looking at, not from a separate re-estimation.
+
+<Tip>
+The annualised figure is the number the PRD identifies as behaviour-changing. A meeting that costs $649 once reads differently when it reads $33,768 a year.
+</Tip>
+
+## Nudge prompts
+
+Nudges are inline, non-blocking prompts shown at scheduling time. Three threshold types are admin-configurable under **Rates & policy**; setting a threshold to zero disables that nudge type entirely.
+
+<CardGroup cols={3}>
+  <Card title="cost_above_threshold" icon="circle-dollar-to-slot">
+    Fires when `cost.total` exceeds the configured `nudge_cost_threshold`. Suggests whether a written update could do the same job.
+  </Card>
+  <Card title="headcount_above_threshold" icon="users">
+    Fires when `headcount` exceeds `nudge_headcount_threshold`. Suggests that attendees who only need the outcome could read the notes instead.
+  </Card>
+  <Card title="duration_above_threshold" icon="clock">
+    Fires when `duration_minutes` exceeds `nudge_duration_minutes_threshold`. Shows how much halving the duration would save.
+  </Card>
+</CardGroup>
+
+An `annualised` nudge is also appended for any cadence other than `one_off` — this one is always present for recurring meetings and is not threshold-gated.
+
+Nothing in v1 blocks the organiser from proceeding. Nudges are informational only.
+
+## The `draft_id` workflow
+
+The `draft_id` is an optional, client-generated string that links successive estimates for the same draft invite. When provided, each response includes a `snapshot_id` so the sequence of changes is traceable.
+
+<Steps>
+  <Step title="First estimate">
+    The add-in generates a `draft_id` (e.g. the calendar client's native event ID) and includes it on every estimate call as the organiser edits the invite list.
+  </Step>
+  <Step title="Successive edits">
+    Each subsequent `POST /api/v1/estimate` for the same `draft_id` appends a new snapshot, recording headcount, duration, total cost, and cadence at that point in time.
+  </Step>
+  <Step title="Commit on send">
+    When the organiser actually sends the invite, the add-in calls `POST /api/v1/estimate/commit`:
+
+    ```json
+    { "draft_id": "gcal-abc123" }
+    ```
+
+    The commit response shows whether the meeting was reduced before sending:
+
+    ```json
+    {
+      "draft_id": "gcal-abc123",
+      "snapshots": 4,
+      "initial_total": "649.38",
+      "final_total": "324.69",
+      "reduced_before_send": true
+    }
+    ```
+  </Step>
+</Steps>
+
+Drafts that are never committed count as abandoned. Together, committed-and-reduced and abandoned drafts feed the organisation-level **reduced before send** metric visible in org-wide reports.
+
+## Fallback rates and `estimated_headcount`
+
+Not every invitee will have a pay record. When no record applies to a person on `meeting_date`, MeetCost prices them at the org-wide `fallback_annual_pay` configured under **Rates & policy**. The response field `estimated_headcount` counts how many attendees were priced this way.
+
+When `estimated_headcount` is non-zero the response also includes a human-readable `coverage_note` you can surface directly to the organiser.
+
+<Warning>
+If no fallback rate has been configured (`fallback_annual_pay = 0`), those attendees contribute **nothing** to the total. The total looks like a real number and is simply missing those people. The `coverage_note` says so explicitly in this case: *"N attendees contributed nothing to this total … This total is understated."*
+</Warning>
+
+Attendees who are not in the directory at all (no directory entry and no pay record) are classified as external and also priced at the fallback rate, with `rate_source` set to `EXTERNAL` rather than `FALLBACK` in the per-person breakdown.
+
+## 409 Conflict: multi-currency meetings
+
+If the invitees hold pay records in more than one currency MeetCost returns `409 Conflict` rather than silently summing across currencies. The response body identifies which currencies collided. Currency conversion is not supported in v1.
+
+## Loading factor and working hours
+
+Two `RateParams` values govern the formula for salaried staff:
+
+| Parameter | Default | Description |
+|---|---|---|
+| `loading_factor` | `1.30` | Multiplier applied to base pay to account for employer costs (NI, pension, benefits, etc.) |
+| `working_hours_per_year` | `2080` | The divisor that converts annual pay to an hourly rate |
+
+Both are configurable via `PATCH /api/v1/admin/config`. The `working_hours_per_year` divisor is **not applied to hourly staff**: someone paid £45/hour is costed at £45/hour directly, because annualising an hourly rate and dividing it back down reintroduces exactly the assumption that makes the number wrong for them.

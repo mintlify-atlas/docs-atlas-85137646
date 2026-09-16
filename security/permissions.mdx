@@ -1,0 +1,144 @@
+---
+title: "Role-Based Access Control and Salary Disclosure Policy"
+sidebarTitle: "Permissions"
+description: "MeetCost's five-role permission model prevents salary inference through per-person breakdown controls, small-meeting suppression, and total banding."
+---
+
+MeetCost's permission model starts from a single arithmetic fact and builds every disclosure rule from it. Because pay is stored per individual, a per-participant cost breakdown is functionally a salary disclosure — in a two-person meeting a breakdown reveals the other person's salary exactly. Everything on this page follows from that. Read it before you change any default; the defaults are conservative because the risk is real, and the unsafe configurations require a deliberate choice.
+
+---
+
+## The five roles
+
+| Role | Aggregate cost | Per-person breakdown | Raw pay data | Reports |
+|---|---|---|---|---|
+| **Participant** | ⚙️ off by default | ❌ never | ❌ | ❌ |
+| **Organiser** | ✅ | ⚙️ off by default | ❌ | Own meetings |
+| **Team lead** | ✅ | ⚙️ off by default | ❌ | Own team |
+| **Finance / HR** | ✅ | ⚙️ | ⚙️ off by default | Org-wide |
+| **Admin** | ✅ | ✅ | ✅ | ✅ |
+
+✅ always on &nbsp; · &nbsp; ❌ never, not configurable &nbsp; · &nbsp; ⚙️ admin-configurable
+
+Anyone with no role assignment is a **participant**. A directory sync that adds a person therefore grants them nothing.
+
+<Note>
+**Organiser is per-meeting, not a rank.** Being the organiser of a meeting raises a participant to organiser *for that meeting only*, so they can see what they are about to spend. It confers no standing reporting rights — a participant who organises one meeting has no access to reports.
+</Note>
+
+---
+
+## Report scope
+
+Scope is derived from the caller's role. It is never a query parameter, so there is no request a client can construct that widens it.
+
+| Role | Scope |
+|---|---|
+| Participant | Nothing. The endpoint returns `403` |
+| Organiser | Meetings they organised |
+| Team lead | Meetings organised by their team. A team lead with no `team_id` set falls back to their own meetings — never wider |
+| Finance / HR | Org-wide |
+| Admin | Org-wide |
+
+Reports are aggregate by construction. There is no per-person spend ranking anywhere in the product or in the CSV export — that is individual productivity scoring, which is explicitly out of scope. The CSV export contains no column that identifies an individual's cost.
+
+---
+
+## The three protections
+
+Three independent mechanisms prevent a cost figure from being reversed into a salary. Each closes a specific channel.
+
+<Steps>
+  <Step title="Per-person breakdown is off below Admin">
+    Turning it on shows Organisers, Team leads, and Finance who cost what within a meeting. It is off by default at every level below Admin, and enabling it requires a deliberate admin action.
+
+    **Stops:** reading an individual's rate straight off a meeting summary.
+  </Step>
+  <Step title="Small-meeting suppression">
+    Even when breakdowns are enabled, they are withheld entirely for meetings with fewer than `small_meeting_threshold` participants (default `5`).
+
+    **Stops:** using a small meeting — where each person is a large share of the total — to isolate one person's cost.
+  </Step>
+  <Step title="Total banding">
+    For meetings below the same threshold, non-admin viewers see the total rounded to two significant figures and labelled **approximate**.
+
+    **Stops:** the inference channel that the first two protections leave open. In a two-person meeting, `total − my own cost = the other person's exact rate`, and every participant knows their own salary. Suppressing the breakdown does nothing about this; the subtraction is done on paper. Banding removes the precision that makes it work, at the cost of a little accuracy on small meetings.
+
+    <Warning>
+    This third protection is not in the original specification — it was added because the specification names the inference risk and the first two protections do not close it. It is controlled by `band_small_meeting_totals` and can be switched off. **There is no good reason to switch it off.**
+    </Warning>
+  </Step>
+</Steps>
+
+---
+
+## Raw pay access
+
+Raw pay means the underlying salary figures, not computed costs. These are distinct things.
+
+- **Admin** may always read and export raw pay.
+- **Finance / HR** may read raw pay only if `finance_can_view_raw_pay` is enabled. It is off by default, and cost reporting does not require it.
+- **Nobody else**, at any setting.
+
+Every reveal writes one audit row **per person revealed**, not one row per request. A single "exported 400 rows" entry would not answer "who has seen my salary?" — which is the question the log exists to answer.
+
+```bash
+# Everything anyone has done with one person's pay data
+curl -s "https://your-meetcost/api/v1/admin/audit?target=person@example.com" \
+  -H "Authorization: Bearer $ADMIN_TOKEN" | jq
+```
+
+---
+
+## Should participants see the cost?
+
+The strongest behaviour lever is a cost summary that everyone in the meeting receives. It is also the biggest cultural risk: the same notification that makes a team reconsider a standing meeting can read as surveillance.
+
+Three options were considered:
+
+| Option | Effect |
+|---|---|
+| **(a)** Everyone sees the total | Strongest lever, highest risk of being resented |
+| **(b)** Organiser only, fixed | Safest, but the people who could shorten a meeting never see the number |
+| **(c)** Configurable, organiser-only default | Ships safe; each organisation decides |
+
+**MeetCost ships option (c).** `participants_see_cost` is off by default, meaning organiser-only. An admin can turn it on.
+
+<Warning>
+Involve HR and, where you have one, your works council before enabling `participants_see_cost`. This is a consultation question, not a configuration question.
+</Warning>
+
+---
+
+## Configuration reference
+
+Configure via the admin UI under **Rates & policy**, or with the API:
+
+```bash
+curl -X PATCH https://your-meetcost/api/v1/admin/config \
+  -H "Authorization: Bearer $ADMIN_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"small_meeting_threshold": 8, "participants_see_cost": true}'
+```
+
+Every change is audited with a before-and-after value.
+
+| Setting | Default | Effect of changing it |
+|---|---|---|
+| `per_person_breakdown_enabled` | `false` | **Raises disclosure risk.** Read this page again before enabling |
+| `small_meeting_threshold` | `5` | Higher is more conservative; must be at least `2` |
+| `participants_see_cost` | `false` | **Cultural change.** Consult HR and works council before enabling |
+| `finance_can_view_raw_pay` | `false` | Grants Finance / HR access to raw salary figures |
+| `band_small_meeting_totals` | `true` | **Turning it off re-opens the subtraction inference channel** |
+
+---
+
+## Verifying the policy holds
+
+The role matrix and all three protections are encoded as tests:
+
+```bash
+pytest server/tests/test_permissions.py -v
+```
+
+If you change a default, that file shows exactly what you have changed and what behaviour it previously asserted.

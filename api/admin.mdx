@@ -1,0 +1,445 @@
+---
+title: "Admin API Endpoints for Pay Data and Configuration"
+sidebarTitle: "/admin"
+description: "Admin-only endpoints for pay data upload, coverage analysis, policy configuration, role management, audit log access, and adapter and directory sync management."
+---
+
+The admin surface is where pay data enters MeetCost, where disclosure policy is configured, and where role assignments are managed. Every route here is restricted to the `admin` role (or the `finance` role for read-only coverage checks) unless noted. The most important invariant on this entire surface: **every route that touches a pay figure writes its audit row in the same database transaction as the read**. A read that was not logged is a read that did not commit. This is not a post-hoc side effect — it is a transactional guarantee.
+
+---
+
+## Pay data
+
+### POST /api/v1/admin/pay/upload
+
+Upload pay data for multiple employees from a CSV file. Requires admin role.
+
+Validation is **all-or-nothing**: if any single row contains an error, nothing is written. A partially-imported payroll would silently fall back the bad entries to the blended default rate, which is worse than no import. Fix every reported error and re-upload.
+
+Pass `?dry_run=true` to validate the file and see what would be written without committing anything.
+
+The CSV upload accepts the following columns. Common header name aliases from popular payroll exports are recognised automatically, because payroll systems never agree on column names. Every bad row is reported at once so operators fix them in one pass.
+
+| Column | Required | Description |
+|---|---|---|
+| `employee_email` | Yes | Employee's work email address |
+| `annual_pay` | Yes | Annual or hourly pay amount (positive number) |
+| `currency` | Yes | ISO 4217 currency code (e.g. `USD`, `GBP`) |
+| `effective_date` | Yes | Date this pay record takes effect (`YYYY-MM-DD`) |
+| `pay_basis` | No | `annual` (default) or `hourly` |
+
+#### Query parameters
+
+<ParamField query="dry_run" type="boolean" default="false">
+  When `true`, validates the CSV and reports any errors but writes nothing to the database. The response shows how many rows would be created or updated.
+</ParamField>
+
+#### Response
+
+```json
+{
+  "created": 142,
+  "updated": 8,
+  "skipped": 0,
+  "errors": []
+}
+```
+
+On validation failure, `errors` contains a list of human-readable error strings (one per bad row, up to 50), and `created`, `updated` are both 0.
+
+#### Example
+
+```bash
+curl -X POST "https://meetcost.acme-corp.internal/api/v1/admin/pay/upload?dry_run=true" \
+  -H "Authorization: Bearer <admin-token>" \
+  -F "file=@payroll-q3-2026.csv"
+```
+
+---
+
+### POST /api/v1/admin/pay
+
+Add or update a pay record for a single employee. Requires admin role.
+
+<ParamField body="employee_email" type="string" required>
+  Employee's email address.
+</ParamField>
+
+<ParamField body="annual_pay" type="number" required>
+  Pay amount. Must be greater than 0.
+</ParamField>
+
+<ParamField body="currency" type="string">
+  ISO 4217 currency code (3 characters). Defaults to the org's `base_currency`.
+</ParamField>
+
+<ParamField body="effective_date" type="string">
+  Date this record takes effect (`YYYY-MM-DD`). Defaults to today.
+</ParamField>
+
+<ParamField body="pay_basis" type="string" default="annual">
+  `annual` or `hourly`.
+</ParamField>
+
+#### Example
+
+```json
+{
+  "employee_email": "ada@example.com",
+  "annual_pay": 95000,
+  "currency": "USD",
+  "effective_date": "2026-01-01",
+  "pay_basis": "annual"
+}
+```
+
+---
+
+### GET /api/v1/admin/pay
+
+List pay records. Requires at minimum the `finance` role.
+
+By default, actual pay amounts are **masked** (shown as a placeholder string like `"USD ***"`). Pass `?reveal=true` to decrypt and return actual amounts. Revealing pay data:
+- Requires admin role, or finance role with `finance_can_view_raw_pay` policy enabled
+- Writes one audit event **per person revealed**, so the question "who has seen my salary data, and when?" is answerable via `GET /api/v1/admin/audit`
+
+#### Query parameters
+
+<ParamField query="reveal" type="boolean" default="false">
+  Decrypt and return actual pay amounts. Audited per person. Requires admin role (or finance role if `finance_can_view_raw_pay` is enabled).
+</ParamField>
+
+<ParamField query="search" type="string">
+  Filter by email address (partial match).
+</ParamField>
+
+<ParamField query="limit" type="integer" default="100">
+  Maximum records to return. Capped at 500.
+</ParamField>
+
+<ParamField query="offset" type="integer" default="0">
+  Pagination offset.
+</ParamField>
+
+#### Response example (masked)
+
+```json
+[
+  {
+    "employee_email": "ada@example.com",
+    "currency": "USD",
+    "effective_date": "2026-01-01",
+    "pay_basis": "annual",
+    "source": "csv",
+    "masked": "USD ***",
+    "amount": null
+  }
+]
+```
+
+#### Response example (revealed)
+
+```json
+[
+  {
+    "employee_email": "ada@example.com",
+    "currency": "USD",
+    "effective_date": "2026-01-01",
+    "pay_basis": "annual",
+    "source": "csv",
+    "masked": "USD ***",
+    "amount": "95000.0000"
+  }
+]
+```
+
+---
+
+### GET /api/v1/admin/pay/export.csv
+
+Export all pay data as a CSV file. **Admin only.** Heavily audited — writes one audit event per row exported.
+
+Returns `text/csv` with the columns: `employee_email`, `annual_pay`, `currency`, `effective_date`, `pay_basis`.
+
+```bash
+curl "https://meetcost.acme-corp.internal/api/v1/admin/pay/export.csv" \
+  -H "Authorization: Bearer <admin-token>" \
+  -o pay-export.csv
+```
+
+---
+
+### DELETE /api/v1/admin/pay/{email}
+
+Delete **all** pay records for an employee. Used for offboarding leavers and processing GDPR/CCPA erasure requests. Requires admin role.
+
+#### Path parameters
+
+<ParamField path="email" type="string" required>
+  The employee's email address. URL-encode the `@` if necessary.
+</ParamField>
+
+#### Response
+
+```json
+{
+  "employee_email": "ada@example.com",
+  "records_removed": 3
+}
+```
+
+---
+
+### GET /api/v1/admin/coverage
+
+Shows how much of the people directory has valid pay data, and how fresh that data is. Requires `finance` role or above.
+
+#### Response
+
+```json
+{
+  "directory_people": 320,
+  "covered_people": 298,
+  "uncovered_people": 22,
+  "coverage_percent": 93.13,
+  "total_records": 412,
+  "newest_effective_date": "2026-07-01",
+  "oldest_effective_date": "2023-01-01",
+  "stale": true,
+  "stale_message": "Newest pay record is 195 days old (threshold 180). Estimates may be understated."
+}
+```
+
+<Note>
+`stale_message` is safe to show directly to finance users. When `stale` is `true`, estimates for some employees may be based on outdated rates. Upload a fresh payroll CSV or trigger an HRIS sync to resolve this.
+</Note>
+
+---
+
+## Configuration
+
+### GET /api/v1/admin/config
+
+Returns the current org configuration. Admin only.
+
+### PATCH /api/v1/admin/config
+
+Updates one or more configuration values. Admin only. Every change is **audited with a before/after snapshot** of the changed fields.
+
+All fields are optional (this is a partial update):
+
+<ParamField body="loading_factor" type="number">
+  Payroll loading multiplier applied to raw salary. Default `1.30` (i.e. 30% on-costs). Must be between 0 and 5.
+</ParamField>
+
+<ParamField body="working_hours_per_year" type="integer">
+  Hours per year used to convert annual pay to an hourly rate. Default `2080`. Must be between 1 and 8760.
+</ParamField>
+
+<ParamField body="fallback_annual_pay" type="number">
+  Org-wide blended annual pay used for employees with no individual record. `0` means uncosted (those people contribute nothing to totals). Must be 0 or greater.
+</ParamField>
+
+<ParamField body="base_currency" type="string">
+  Default currency for the org (ISO 4217, 3 characters). Used when a pay record has no explicit currency.
+</ParamField>
+
+<ParamField body="per_person_breakdown_enabled" type="boolean">
+  When `true`, authorised callers can see individual per-person costs in responses. Default `false`. Enabling this has privacy implications — it is audited and flagged in the admin UI.
+</ParamField>
+
+<ParamField body="small_meeting_threshold" type="integer">
+  Minimum headcount below which per-person breakdowns are suppressed even when `per_person_breakdown_enabled` is `true`. Default `5`. Range 2–100.
+</ParamField>
+
+<ParamField body="participants_see_cost" type="boolean">
+  When `false` (the default), only organisers see cost totals. Participants see headcount and duration only.
+</ParamField>
+
+<ParamField body="finance_can_view_raw_pay" type="boolean">
+  When `true`, users with the `finance` role may call `GET /api/v1/admin/pay?reveal=true`. Default `false`.
+</ParamField>
+
+<ParamField body="band_small_meeting_totals" type="boolean">
+  When `true`, totals for small meetings are rounded to two significant figures (`total_is_approximate: true`). Default `true`.
+</ParamField>
+
+<ParamField body="nudge_cost_threshold" type="number">
+  Cost above which a `cost_above_threshold` nudge is emitted. Default `500`.
+</ParamField>
+
+<ParamField body="nudge_headcount_threshold" type="integer">
+  Headcount above which a headcount nudge is emitted. Default `8`.
+</ParamField>
+
+<ParamField body="nudge_duration_minutes_threshold" type="integer">
+  Duration above which a duration nudge is emitted. Default `60`.
+</ParamField>
+
+<ParamField body="pay_data_max_age_days" type="integer">
+  Age (in days) after which pay data is considered stale. Affects the `stale` flag in coverage reports. Default `180`.
+</ParamField>
+
+#### Example
+
+```bash
+curl -X PATCH https://meetcost.acme-corp.internal/api/v1/admin/config \
+  -H "Authorization: Bearer <admin-token>" \
+  -H "Content-Type: application/json" \
+  -d '{"participants_see_cost": true, "nudge_cost_threshold": 750}'
+```
+
+#### Response
+
+```json
+{
+  "changed": {
+    "participants_see_cost": {"before": false, "after": true},
+    "nudge_cost_threshold": {"before": "500.0000", "after": "750.0000"}
+  },
+  "config": {
+    "loading_factor": "1.3000",
+    "working_hours_per_year": 2080,
+    "participants_see_cost": true,
+    "nudge_cost_threshold": "750.0000"
+  }
+}
+```
+
+---
+
+## Role management
+
+### GET /api/v1/admin/roles
+
+Lists all role assignments. Admin only.
+
+```json
+[
+  {
+    "email": "bola@example.com",
+    "role": "finance",
+    "team_id": null,
+    "granted_by": "ada@example.com",
+    "granted_at": "2026-06-01T10:30:00Z"
+  }
+]
+```
+
+### PUT /api/v1/admin/roles
+
+Assign or update a role. Admin only. Audited.
+
+<ParamField body="email" type="string" required>
+  The user's email address.
+</ParamField>
+
+<ParamField body="role" type="string" required>
+  One of `participant`, `organiser`, `team_lead`, `finance`, `admin`.
+</ParamField>
+
+<ParamField body="team_id" type="string">
+  Team identifier for `team_lead` assignments. Scopes the team_lead's reporting access.
+</ParamField>
+
+### DELETE /api/v1/admin/roles/{email}
+
+Revokes the role assignment for the specified email. The user reverts to `participant`. Admin only. Audited. Returns `404` if no role row exists.
+
+---
+
+## Audit log
+
+### GET /api/v1/admin/audit
+
+Query the audit log. Admin only.
+
+<ParamField query="target" type="string">
+  Filter by the target of the action. Pass an employee email to answer: "who has accessed this person's pay data, and when?"
+</ParamField>
+
+<ParamField query="actor" type="string">
+  Filter by the actor (the person who performed the action).
+</ParamField>
+
+<ParamField query="action" type="string">
+  Filter by action type, e.g. `PAY_VIEW`, `PAY_EXPORT`, `CONFIG_UPDATE`, `ROLE_GRANT`.
+</ParamField>
+
+<ParamField query="days" type="integer" default="30">
+  Look back this many days. Range 1–3650.
+</ParamField>
+
+<ParamField query="limit" type="integer" default="200">
+  Maximum events to return. Capped at 1000.
+</ParamField>
+
+#### Response example
+
+```json
+[
+  {
+    "id": "e1f2a3b4...",
+    "at": "2026-08-28T14:22:10Z",
+    "actor": "bola@example.com",
+    "actor_role": "finance",
+    "action": "PAY_VIEW",
+    "target": "ada@example.com",
+    "detail": { "via": "admin_list", "search": null },
+    "source_ip": "10.0.1.42"
+  }
+]
+```
+
+---
+
+## Adapters and sync
+
+### GET /api/v1/admin/adapters
+
+Returns which provider adapters have credentials configured. An adapter with no credentials simply does nothing — it is not an error. Admin only.
+
+```json
+{
+  "google": { "configured": true },
+  "microsoft": { "configured": true },
+  "zoom": { "configured": false }
+}
+```
+
+### POST /api/v1/admin/sync/directory
+
+Triggers a directory sync immediately rather than waiting for the scheduled run. Admin only.
+
+<ParamField query="provider" type="string">
+  Sync only this provider (`google`, `microsoft`). Omit to sync all configured providers.
+</ParamField>
+
+Returns a list of sync results, one per provider run:
+
+```json
+[
+  {
+    "adapter": "google",
+    "created": 5,
+    "updated": 12,
+    "deactivated": 1,
+    "errors": []
+  }
+]
+```
+
+Returns `412 Precondition Failed` if no directory provider is configured.
+
+### POST /api/v1/admin/sync/hris
+
+Pulls pay data from the configured HRIS integration. Admin only. Returns `412 Precondition Failed` if `MEETCOST_HRIS_ADAPTER` is not set.
+
+```json
+{
+  "adapter": "workday",
+  "created": 18,
+  "updated": 6,
+  "errors": []
+}
+```

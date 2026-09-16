@@ -1,0 +1,90 @@
+---
+title: "MeetCost: Self-Hosted Meeting Cost Visibility"
+sidebarTitle: "Introduction"
+description: "MeetCost is a self-hosted meeting cost estimator for Google Meet, Zoom, and Teams. Payroll data is encrypted and never leaves your infrastructure."
+---
+
+A recurring eight-person weekly sync feels free at the point of scheduling. It is not — it is roughly £40,000 a year of payroll, and because nobody sees that number, nobody optimises against it. Every tool that surfaces this number today is SaaS, which means shipping salary data to a third-party cloud. For most finance and HR teams that is where the conversation ends. MeetCost is the same idea, self-hosted: the calculation runs on your infrastructure, against your database, under your encryption key.
+
+## What problem MeetCost solves
+
+Meeting cost is a hidden expense at almost every organisation. The people in the room have a combined hourly cost that compounds invisibly across recurring series. A weekly one-hour sync with eight senior engineers can exceed £30,000 a year, but that figure never appears in the calendar interface where the decision is being made.
+
+The alternatives that do surface this number are SaaS products — meaning payroll data leaves your network, sits in someone else's database, and is subject to their retention and access policies. For organisations with strict data residency requirements or works council agreements covering salary data, those products are simply unavailable to them.
+
+MeetCost solves both problems together: it puts the cost figure in front of the organiser at the moment they are scheduling, and it does so with a self-hosted deployment that keeps every pay record inside your own infrastructure.
+
+## Core architecture
+
+Thin browser clients — a Google Meet add-on, a Zoom app, and a Teams app — communicate exclusively with an operator-configured backend URL. They carry no payroll data themselves; they send only meeting metadata (invitee list, duration, cadence) and receive back a redacted cost total. The MeetCost service runs the rate engine against an encrypted Postgres database that you own, and serves the result. No vendor-operated relay, no analytics SDK, no telemetry of any kind.
+
+```
+  ┌─────────────┐  ┌───────────┐  ┌────────────┐
+  │ Meet add-on │  │ Zoom app  │  │ Teams app  │     thin clients — no pay data
+  └──────┬──────┘  └─────┬─────┘  └─────┬──────┘
+         └───────────────┼──────────────┘
+                  HTTPS, your domain only
+                         │
+              ┌──────────▼───────────┐
+              │   MeetCost service   │   rate engine · directory sync · reports
+              └──────────┬───────────┘
+                         │
+                   ┌─────▼─────┐
+                   │ Postgres  │   pay data, encrypted with your key
+                   └───────────┘
+```
+
+## Key design decisions
+
+These are structural choices baked into the product, not policy knobs.
+
+**No per-person cost breakdowns below the Admin role.** In a two-person meeting, the total minus your own cost is your colleague's exact pay. Per-person breakdowns are withheld by default for non-admin viewers, and totals for small meetings (under five participants) are rounded to two significant figures to prevent reverse-engineering individual salaries.
+
+**No currency conversion.** A meeting whose participants hold pay records in different currencies is refused with an explanation rather than silently summed with a hidden exchange-rate assumption baked in. Multi-currency support is a planned v2 feature.
+
+**Hourly staff are not annualised.** Someone paid £45/hour is costed at £45/hour, not at an annualised salary divided back down by an assumed 2,080-hour working year. That assumption is precisely what makes the number wrong for hourly workers.
+
+**No per-person rankings.** Not in the UI, not in exports. MeetCost is a meeting-hygiene tool, not a productivity-scoring tool, and the distinction is structural rather than a matter of configuration.
+
+**No SaaS, no telemetry.** The egress allowlist is enforced in code and asserted in CI. MeetCost refuses to start in production if the allowlist is disabled, on the grounds that a deployment without its data-residency guarantees is worse than one that does not boot at all.
+
+## Role model
+
+Access is governed by five roles. The absence of a role row in the database means `participant`.
+
+| Role | What they can do |
+|---|---|
+| **participant** | See that a meeting has a cost (if sharing is enabled); no figures by default |
+| **organiser** | See the cost of meetings they schedule; receive post-meeting actuals |
+| **team_lead** | See aggregate cost reports for their own team |
+| **finance** | See org-wide cost reports and CSV exports |
+| **admin** | Manage pay records, configure policy, view audit log, assign roles |
+
+Roles are assigned with `meetcost grant <email> <role>` from the CLI, or through the admin UI. The bootstrap admin list (`MEETCOST_BOOTSTRAP_ADMINS`) seeds the first admin before the UI is accessible.
+
+## What MeetCost does, in brief
+
+**While scheduling** — the estimated cost updates live as invitees are added or duration changes, with the annualised figure for recurring meetings and configurable nudges when cost, headcount, or duration cross a threshold. Nothing blocks the organiser from proceeding.
+
+**After the meeting** — the actual cost from actual attendance and actual duration, not what was booked. Includes no-shows, early leavers, and minutes lost to late joins, compared against the original estimate.
+
+**Periodically** — weekly and monthly digests by team and org-wide: total spend, spend by recurring series with an annual run-rate, largest single meetings, and the trend against the previous period. CSV export, permission-gated.
+
+**For admins** — CSV upload or manual pay data entry, optional HRIS sync, encryption at rest under an org-supplied key, masked display by default, and a full audit log of who viewed or exported what.
+
+---
+
+<CardGroup cols={2}>
+  <Card title="Quickstart" icon="rocket" href="/quickstart">
+    Running locally with Docker or Python in under 15 minutes. Seed demo data and hit the estimate API.
+  </Card>
+  <Card title="Deployment" icon="server" href="/deployment">
+    Production setup with Postgres, OIDC, a secret manager, and a Helm chart.
+  </Card>
+  <Card title="API Reference" icon="code" href="/api">
+    Full endpoint reference for `/api/v1/estimate`, post-meeting webhooks, and the admin API.
+  </Card>
+  <Card title="Privacy" icon="shield-halved" href="/security/privacy">
+    Exactly what crosses the wire, the egress allowlist, and the test that keeps the claim honest.
+  </Card>
+</CardGroup>

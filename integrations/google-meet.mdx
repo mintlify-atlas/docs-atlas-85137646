@@ -1,0 +1,225 @@
+---
+title: "MeetCost Google Meet Add-On Setup Guide"
+sidebarTitle: "Google Meet"
+description: "Install and configure the MeetCost Google Meet add-on to show live meeting cost estimates inside Google Meet and Google Calendar."
+---
+
+The MeetCost Google Meet add-on surfaces a live cost estimate in the Google Calendar side panel while an organiser is still writing an invite — and shows the actual cost after the meeting ends, once the Google Reports API has published its attendance record. It is a pure rendering layer: it reads the event the user already has open, sends attendee addresses and duration to your organisation's own MeetCost backend, and draws whatever comes back. No pay figure is ever written back to Google, and the add-on holds no salary or rate data of any kind.
+
+## How the add-on works
+
+The add-on is a Google Apps Script project deployed as a Workspace Add-on from the `clients/google-meet-addon/` directory. When a calendar event is opened, `onCalendarEventOpen` fires; when attendees or times change, `onCalendarEventUpdate` fires. Each trigger calls `buildEventCard`, which reads the open event's attendees, filters out rooms and declined guests, resolves the RRULE cadence, and POSTs to `/api/v1/estimate` on your MeetCost backend.
+
+<Note>
+The add-on requests `currentEventAccess: READ` and nothing wider. It cannot see any calendar the user has not explicitly opened, and it has no write scope of any kind.
+</Note>
+
+### OAuth scopes
+
+| Scope | Why it is needed |
+|---|---|
+| `calendar.addons.execute` | Run as a Calendar add-on |
+| `calendar.addons.current.event.read` | Read the open event's attendees and times |
+| `script.external_request` | Call your MeetCost backend |
+| `userinfo.email`, `openid` | Prove who the user is to your backend via OIDC |
+
+---
+
+## Prerequisites
+
+Before you begin, confirm:
+
+- You have a deployed MeetCost backend reachable over HTTPS.
+- A Google Workspace admin account is available to grant domain-wide delegation and publish the add-on to the domain.
+- A Google Cloud service account exists (or can be created) with the Admin SDK API enabled, for directory sync and attendance polling.
+
+---
+
+## Installation
+
+<Steps>
+  <Step title="Create the Apps Script project">
+    Go to [script.google.com](https://script.google.com) and create a **New project**. Copy `Code.gs`, `Config.gs`, and `Ui.gs` from `clients/google-meet-addon/` into the project.
+  </Step>
+
+  <Step title="Apply the manifest">
+    In **Project Settings**, enable **Show "appsscript.json" manifest file**, then replace the contents with the `appsscript.json` from `clients/google-meet-addon/`:
+
+    ```json
+    {
+      "timeZone": "Etc/UTC",
+      "exceptionLogging": "STACKDRIVER",
+      "runtimeVersion": "V8",
+      "oauthScopes": [
+        "https://www.googleapis.com/auth/calendar.addons.execute",
+        "https://www.googleapis.com/auth/calendar.addons.current.event.read",
+        "https://www.googleapis.com/auth/script.external_request",
+        "https://www.googleapis.com/auth/userinfo.email",
+        "openid"
+      ],
+      "addOns": {
+        "common": {
+          "name": "MeetCost",
+          "logoUrl": "https://www.gstatic.com/images/icons/material/system/1x/attach_money_black_24dp.png",
+          "useLocaleFromApp": true,
+          "homepageTrigger": { "runFunction": "onHomepage" }
+        },
+        "calendar": {
+          "currentEventAccess": "READ",
+          "eventOpenTrigger": { "runFunction": "onCalendarEventOpen" },
+          "eventUpdateTrigger": { "runFunction": "onCalendarEventUpdate" }
+        }
+      },
+      "urlFetchWhitelist": [
+        "https://meetcost.your-company.example/"
+      ]
+    }
+    ```
+
+    Replace `https://meetcost.your-company.example/` with your actual MeetCost address. Apps Script will refuse to reach any other host.
+  </Step>
+
+  <Step title="Set the backend URL script property">
+    In **Project Settings → Script Properties**, add:
+
+    | Property | Value |
+    |---|---|
+    | `MEETCOST_BACKEND_URL` | `https://meetcost.your-company.example` |
+
+    If this property is unset, the add-on displays a configuration message and does nothing. There is no default and no fallback — by design.
+  </Step>
+
+  <Step title="Test on your own account">
+    Go to **Deploy → Test deployments**, install the add-on on your own account, open a calendar event, and confirm the MeetCost card appears in the side panel.
+  </Step>
+
+  <Step title="Publish to your Workspace domain">
+    Go to **Deploy → New deployment → Add-on**, then publish through the **Google Workspace Marketplace SDK**. Choose **Private (domain-only)** distribution — this requires no Google review and is available to everyone in your Workspace organisation immediately.
+  </Step>
+</Steps>
+
+---
+
+## Authentication
+
+The add-on identifies the calling user with `ScriptApp.getIdentityToken()`, which returns a Google-issued OpenID Connect token. The backend verifies this token against the OIDC issuer `https://accounts.google.com`. MeetCost has no accounts and no passwords: the identity assertion is Google's own, travelling to your organisation's own infrastructure.
+
+```javascript
+// From Config.gs — how the identity token is attached to every request
+function getIdentityToken() {
+  return ScriptApp.getIdentityToken();
+}
+
+function callBackend(path, method, payload) {
+  var options = {
+    method: method || 'get',
+    muteHttpExceptions: true,
+    headers: {
+      Authorization: 'Bearer ' + getIdentityToken(),
+      'Content-Type': 'application/json'
+    }
+  };
+  if (payload) {
+    options.payload = JSON.stringify(payload);
+  }
+  return UrlFetchApp.fetch(getBackendUrl() + path, options);
+}
+```
+
+<Tip>
+The backend must be configured with `MEETCOST_OIDC_ISSUER=https://accounts.google.com` and `MEETCOST_OIDC_AUDIENCE` set to your Workspace client ID for token verification to succeed.
+</Tip>
+
+---
+
+## Directory sync
+
+MeetCost looks up pay figures by email address, so it needs a copy of your Workspace user directory. The Google adapter authenticates with a service account using a JWT grant (domain-wide delegation), then pages through the Admin SDK Directory API.
+
+### Required environment variables on the server
+
+| Variable | Description |
+|---|---|
+| `MEETCOST_GOOGLE_DIRECTORY_CUSTOMER_ID` | Your Workspace customer ID (found in the Admin console under Account → Profile) |
+| `MEETCOST_GOOGLE_SERVICE_ACCOUNT_FILE` | Absolute path to the service account JSON key file |
+| `MEETCOST_GOOGLE_ADMIN_SUBJECT` | Email address of the Workspace admin the service account impersonates |
+
+### Service account permissions
+
+Grant the service account **domain-wide delegation** in your Workspace Admin console, with these OAuth scopes:
+
+| Scope | Purpose |
+|---|---|
+| `https://www.googleapis.com/auth/admin.directory.user.readonly` | Read the user directory |
+| `https://www.googleapis.com/auth/admin.reports.audit.readonly` | Read Meet Reports API events |
+
+The service account must have the **Admin SDK API** enabled in your Google Cloud project (`admin.googleapis.com`).
+
+<Warning>
+Never grant the service account write access to the directory. MeetCost is read-only; if you find yourself needing a write scope, something has gone wrong in your setup.
+</Warning>
+
+---
+
+## Attendance collection
+
+Google Meet has no end-of-meeting webhook. Attendance is polled from the Reports API `meet` application, `call_ended` events. Because the Reports API is eventually consistent — events can lag a meeting's end by minutes to hours — MeetCost uses a poller with an overlapping window rather than a one-shot read.
+
+Run the collector on a schedule (for example, every 15 minutes via cron):
+
+```bash
+meetcost collect google --hours 3
+```
+
+The `--hours` flag sets how far back the window reaches. Use a value larger than the typical lag you observe in your domain; `3` is a reasonable starting point.
+
+### Authenticated trigger via webhook
+
+For operator-initiated sweeps, the backend also exposes an authenticated trigger endpoint:
+
+```
+POST /webhooks/google/poll
+```
+
+This endpoint accepts a request authenticated with either an admin token or the service account's own credential, and immediately runs the Reports API sweep for the configured window. It is useful for triggering a collect after a known meeting ends, without waiting for the cron.
+
+<Note>
+The webhook trigger does not replace the cron. Reports API events can still be delayed after the trigger fires. Run both for reliable coverage.
+</Note>
+
+---
+
+## Cadence and the annualised figure
+
+The add-on maps Google Calendar's `RRULE` values to MeetCost cadences automatically:
+
+| RRULE pattern | MeetCost cadence |
+|---|---|
+| `FREQ=DAILY;INTERVAL=1` | `daily` |
+| `FREQ=WEEKLY;INTERVAL=1` | `weekly` |
+| `FREQ=WEEKLY;INTERVAL=2` | `biweekly` |
+| `FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR` | `weekdaily` |
+| `FREQ=MONTHLY;INTERVAL=1` | `monthly` |
+| `FREQ=MONTHLY;INTERVAL=3` | `quarterly` |
+| Anything else | `one_off` (no annual figure shown) |
+
+When the cadence is `one_off` or cannot be determined, the annualised figure is suppressed rather than guessed. The organiser can always set the cadence manually in the card. Showing no annual figure is better than showing a wrong one.
+
+---
+
+## Security model
+
+<CardGroup cols={2}>
+  <Card title="No pay data to Google" icon="shield-check">
+    The add-on never sends a salary, rate, or cost figure to Google. It sends attendee email addresses and duration — data the user already has on screen.
+  </Card>
+  <Card title="No default backend" icon="lock">
+    The `urlFetchWhitelist` in `appsscript.json` and the `MEETCOST_BACKEND_URL` script property together enforce that the add-on contacts only the URL your administrator set. There is no fallback address.
+  </Card>
+  <Card title="HTTPS enforced" icon="globe">
+    `getBackendUrl()` rejects plaintext URLs to any host other than `localhost`. Identity tokens are never sent over unencrypted connections to production addresses.
+  </Card>
+  <Card title="Read-only event access" icon="eye">
+    `currentEventAccess: READ` is the narrowest scope Calendar add-ons can request. The add-on cannot modify any event or see any calendar the user has not opened.
+  </Card>
+</CardGroup>

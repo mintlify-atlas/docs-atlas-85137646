@@ -1,7 +1,7 @@
 ---
-title: "Get Started with MeetCost in Under 15 Minutes"
+title: "Run MeetCost Locally with Docker or Python Virtualenv"
 sidebarTitle: "Quickstart"
-description: "Run MeetCost locally with Docker or Python, seed demo data, and get a live meeting cost estimate from the API in under 15 minutes."
+description: "Clone the repo, generate an encryption key, seed demo data, and call the estimate API — Docker or Python virtualenv, under 15 minutes."
 ---
 
 This guide takes you from a fresh clone to a working local deployment with real cost figures on screen — seeded with eight fictional employees and a handful of completed meetings so the reports have something in them from the first load. There are two paths: Docker (fewest prerequisites) and plain Python with a virtual environment. Pick the one that matches your setup; both land at the same place.
@@ -156,9 +156,18 @@ This guide takes you from a fresh clone to a working local deployment with real 
 
 The `meetcost token` command mints a short-lived JWT signed with your `MEETCOST_SECRET_KEY`. It works only when `MEETCOST_ENVIRONMENT` is not `production`.
 
-```bash
-./.venv/bin/meetcost token ada@example.com
-```
+<Tabs>
+  <Tab title="With Docker">
+    ```bash
+    docker compose exec meetcost meetcost token ada@example.com
+    ```
+  </Tab>
+  <Tab title="Without Docker">
+    ```bash
+    ./.venv/bin/meetcost token ada@example.com
+    ```
+  </Tab>
+</Tabs>
 
 This prints the token to stdout. The curl example below captures it into a shell variable in one step.
 
@@ -170,16 +179,32 @@ This prints the token to stdout. The curl example below captures it into a shell
 
 With the service running and demo data seeded, ask for the cost of a one-hour weekly sync with all eight demo employees:
 
-```bash
-TOKEN=$(./.venv/bin/meetcost token ada@example.com)
+<Tabs>
+  <Tab title="With Docker">
+    ```bash
+    TOKEN=$(docker compose exec meetcost meetcost token ada@example.com)
 
-curl -s localhost:8000/api/v1/estimate \
-  -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
-  -d '{"invitees":["ada@example.com","bola@example.com","chen@example.com",
-                   "dia@example.com","emeka@example.com","fatima@example.com",
-                   "gus@example.com","hana@example.com"],
-       "duration_minutes":60,"cadence":"weekly"}' | jq
-```
+    curl -s localhost:8000/api/v1/estimate \
+      -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+      -d '{"invitees":["ada@example.com","bola@example.com","chen@example.com",
+                       "dia@example.com","emeka@example.com","fatima@example.com",
+                       "gus@example.com","hana@example.com"],
+           "duration_minutes":60,"cadence":"weekly"}' | jq
+    ```
+  </Tab>
+  <Tab title="Without Docker">
+    ```bash
+    TOKEN=$(./.venv/bin/meetcost token ada@example.com)
+
+    curl -s localhost:8000/api/v1/estimate \
+      -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+      -d '{"invitees":["ada@example.com","bola@example.com","chen@example.com",
+                       "dia@example.com","emeka@example.com","fatima@example.com",
+                       "gus@example.com","hana@example.com"],
+           "duration_minutes":60,"cadence":"weekly"}' | jq
+    ```
+  </Tab>
+</Tabs>
 
 The response includes the per-occurrence cost, the annualised total for the given cadence, and any configured nudges:
 

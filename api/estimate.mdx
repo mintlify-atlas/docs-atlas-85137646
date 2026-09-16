@@ -1,7 +1,7 @@
 ---
-title: "POST /api/v1/estimate — Meeting Cost Estimation"
-sidebarTitle: "/estimate"
-description: "POST /api/v1/estimate returns the payroll cost for a set of invitees. POST /api/v1/estimate/commit records that the organiser sent the invite."
+title: "Estimate Meeting Payroll Cost and Commit the Draft"
+sidebarTitle: "Estimate"
+description: "POST /api/v1/estimate returns the payroll cost for up to 500 invitees. POST /api/v1/estimate/commit records that the organiser sent the invite."
 ---
 
 The estimate endpoints are the scheduling-time surface of MeetCost. `POST /api/v1/estimate` is designed to be called on every meaningful edit to a calendar draft — changing the invitee list, adjusting the duration, switching from a one-off to a recurring meeting — and is deliberately a single round trip with no fan-out. `POST /api/v1/estimate/commit` closes the loop by recording that the organiser actually sent the invite, enabling the "reduced before send" metric that shows whether the nudges are working.
@@ -167,7 +167,8 @@ Estimate the payroll cost of a meeting that has not happened yet. Requires authe
     },
     {
       "code": "annualised",
-      "message": "At this cadence that is about USD 33,768 a year."
+      "message": "At this cadence that is about USD 33,768 a year.",
+      "threshold": "cadence != one_off"
     }
   ],
   "coverage_note": null,

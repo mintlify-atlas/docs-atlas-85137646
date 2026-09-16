@@ -1,7 +1,7 @@
 ---
-title: "MeetCost Google Meet Add-On Setup Guide"
+title: "Google Meet Add-On: Install and Configure MeetCost"
 sidebarTitle: "Google Meet"
-description: "Install and configure the MeetCost Google Meet add-on to show live meeting cost estimates inside Google Meet and Google Calendar."
+description: "Deploy the MeetCost Google Workspace add-on to surface live cost estimates in Calendar and collect attendance from the Reports API."
 ---
 
 The MeetCost Google Meet add-on surfaces a live cost estimate in the Google Calendar side panel while an organiser is still writing an invite — and shows the actual cost after the meeting ends, once the Google Reports API has published its attendance record. It is a pure rendering layer: it reads the event the user already has open, sends attendee addresses and duration to your organisation's own MeetCost backend, and draws whatever comes back. No pay figure is ever written back to Google, and the add-on holds no salary or rate data of any kind.
@@ -173,18 +173,18 @@ meetcost collect google --hours 3
 
 The `--hours` flag sets how far back the window reaches. Use a value larger than the typical lag you observe in your domain; `3` is a reasonable starting point.
 
-### Authenticated trigger via webhook
+### Authenticated trigger endpoint
 
-For operator-initiated sweeps, the backend also exposes an authenticated trigger endpoint:
+For operator-initiated sweeps, the backend also exposes an authenticated admin endpoint:
 
+```http
+POST /webhooks/google/poll?hours=3
 ```
-POST /webhooks/google/poll
-```
 
-This endpoint accepts a request authenticated with either an admin token or the service account's own credential, and immediately runs the Reports API sweep for the configured window. It is useful for triggering a collect after a known meeting ends, without waiting for the cron.
+This endpoint requires an admin-role token (or a configured service token). It immediately queues a Reports API sweep for the given window. The `hours` query parameter is optional and defaults to `24`. It is useful for triggering a collect after a known meeting ends without waiting for the cron.
 
 <Note>
-The webhook trigger does not replace the cron. Reports API events can still be delayed after the trigger fires. Run both for reliable coverage.
+The poll trigger does not replace the cron. Reports API events can still be delayed after the trigger fires. Run both for reliable coverage.
 </Note>
 
 ---

@@ -1,7 +1,7 @@
 ---
-title: "MeetCost Architecture and Code Layout"
+title: "MeetCost Architecture: Layers, Storage Schema, Boot Sequence"
 sidebarTitle: "Architecture"
-description: "Understand MeetCost's layered architecture: engine, service, HTTP, and infrastructure layers, plus the storage schema, request paths, and deliberate design absences."
+description: "How MeetCost's four layers, Postgres schema, boot sequence, and egress guard work together to keep pay data inside your infrastructure."
 ---
 
 MeetCost is a single self-hosted Python service backed by Postgres, with three thin browser clients that carry no payroll data. The code is organised in four layers with a strict one-way dependency direction: HTTP depends on service, service depends on engine, and nothing in the engine knows about HTTP, the database, or the clock. This means every number the product displays can be traced to a single module — `rates.py` — without following a call graph through the rest of the codebase.

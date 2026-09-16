@@ -1,10 +1,10 @@
 ---
-title: "Admin API Endpoints for Pay Data and Configuration"
-sidebarTitle: "/admin"
-description: "Admin-only endpoints for pay data upload, coverage analysis, policy configuration, role management, audit log access, and adapter and directory sync management."
+title: "Admin Endpoints: Pay Data, Configuration, and Roles"
+sidebarTitle: "Admin"
+description: "Admin endpoints for pay data upload and management, coverage checks, policy configuration, role assignment, audit log queries, directory, and adapter sync."
 ---
 
-The admin surface is where pay data enters MeetCost, where disclosure policy is configured, and where role assignments are managed. Every route here is restricted to the `admin` role (or the `finance` role for read-only coverage checks) unless noted. The most important invariant on this entire surface: **every route that touches a pay figure writes its audit row in the same database transaction as the read**. A read that was not logged is a read that did not commit. This is not a post-hoc side effect — it is a transactional guarantee.
+The admin surface is where pay data enters MeetCost, where disclosure policy is configured, and where role assignments are managed. Every route here is restricted to the `admin` role (or the `finance` role for read-only coverage and pay listing) unless noted. The most important invariant on this entire surface: **every route that touches a pay figure writes its audit row in the same database transaction as the read**. A read that was not logged is a read that did not commit. This is not a post-hoc side effect — it is a transactional guarantee.
 
 ---
 
@@ -18,7 +18,7 @@ Validation is **all-or-nothing**: if any single row contains an error, nothing i
 
 Pass `?dry_run=true` to validate the file and see what would be written without committing anything.
 
-The CSV upload accepts the following columns. Common header name aliases from popular payroll exports are recognised automatically, because payroll systems never agree on column names. Every bad row is reported at once so operators fix them in one pass.
+The CSV upload accepts the following columns. Common header name aliases from popular payroll exports are recognised automatically, because payroll systems never agree on column names. Every bad row is reported at once so operators can fix them in one pass.
 
 | Column | Required | Description |
 |---|---|---|
@@ -171,7 +171,7 @@ curl "https://meetcost.acme-corp.internal/api/v1/admin/pay/export.csv" \
 
 ### DELETE /api/v1/admin/pay/{email}
 
-Delete **all** pay records for an employee. Used for offboarding leavers and processing GDPR/CCPA erasure requests. Requires admin role.
+Delete **all** pay records for an employee. Used for offboarding leavers and processing GDPR/CCPA erasure requests. Requires admin role. Deletes every version of the record (all effective dates).
 
 #### Path parameters
 
@@ -277,7 +277,7 @@ All fields are optional (this is a partial update):
 </ParamField>
 
 <ParamField body="pay_data_max_age_days" type="integer">
-  Age (in days) after which pay data is considered stale. Affects the `stale` flag in coverage reports. Default `180`.
+  Age (in days) after which pay data is considered stale. Affects the `stale` flag in coverage reports. Default `180`. Minimum 1.
 </ParamField>
 
 #### Example
@@ -393,6 +393,37 @@ Query the audit log. Admin only.
 
 ---
 
+## Directory
+
+### GET /api/v1/admin/directory
+
+Lists people in the directory, ordered by email. Admin only. The directory is populated by the directory sync adapters and is read-only via this endpoint.
+
+#### Query parameters
+
+<ParamField query="limit" type="integer" default="100">
+  Maximum records to return. Capped at 1000.
+</ParamField>
+
+#### Response example
+
+```json
+[
+  {
+    "email": "ada@example.com",
+    "display_name": "Ada Lovelace",
+    "team_id": "eng",
+    "team_name": "Engineering",
+    "department": "Product Engineering",
+    "is_active": true,
+    "source": "google",
+    "synced_at": "2026-08-28T08:00:00Z"
+  }
+]
+```
+
+---
+
 ## Adapters and sync
 
 ### GET /api/v1/admin/adapters
@@ -442,4 +473,20 @@ Pulls pay data from the configured HRIS integration. Admin only. Returns `412 Pr
   "updated": 6,
   "errors": []
 }
+```
+
+### GET /api/v1/admin/sync-state
+
+Returns the last-run timestamps and record counts for every adapter. Use this to check whether the directory or HRIS sync is current and to diagnose staleness. Admin only.
+
+```json
+[
+  {
+    "adapter": "google",
+    "last_run_at": "2026-08-28T08:00:00Z",
+    "last_success_at": "2026-08-28T08:00:05Z",
+    "record_count": 298,
+    "last_error": null
+  }
+]
 ```

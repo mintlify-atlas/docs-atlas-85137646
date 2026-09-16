@@ -40,20 +40,15 @@ At scheduling time every invited person is assumed to attend for the full booked
 <Tabs>
   <Tab title="curl">
     ```bash
-    TOKEN=$(meetcost token ada@example.com)
+    TOKEN=$(./.venv/bin/meetcost token ada@example.com)
 
     curl -s localhost:8000/api/v1/estimate \
       -H "Authorization: Bearer $TOKEN" \
       -H 'Content-Type: application/json' \
-      -d '{
-        "invitees": [
-          "ada@example.com", "bola@example.com", "chen@example.com",
-          "dia@example.com", "emeka@example.com", "fatima@example.com",
-          "gus@example.com", "hana@example.com"
-        ],
-        "duration_minutes": 60,
-        "cadence": "weekly"
-      }' | jq
+      -d '{"invitees":["ada@example.com","bola@example.com","chen@example.com",
+                       "dia@example.com","emeka@example.com","fatima@example.com",
+                       "gus@example.com","hana@example.com"],
+           "duration_minutes":60,"cadence":"weekly"}' | jq
     ```
   </Tab>
   <Tab title="Response">

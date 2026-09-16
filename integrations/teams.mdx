@@ -1,7 +1,7 @@
 ---
-title: "MeetCost Microsoft Teams App Setup Guide"
+title: "Teams and Outlook Add-In: Install and Configure MeetCost"
 sidebarTitle: "Teams"
-description: "Add MeetCost to Microsoft Teams and Outlook to display meeting cost estimates. Configure Microsoft 365 credentials, the Graph API webhook, and the Teams app manifest."
+description: "Deploy MeetCost to Microsoft Teams and Outlook. Configure Entra ID app registrations, the Graph callRecords webhook, and directory sync."
 ---
 
 The MeetCost Teams app and Outlook add-in are a single page that serves three surfaces from one deployment: an Outlook appointment compose pane that shows a live estimate while the organiser writes the invite, a Teams meeting side panel that shows what the meeting has cost once Graph publishes its call record, and a Teams personal tab with a manual estimator for planning. All three surfaces send meeting context to your organisation's own MeetCost backend; no salary, rate, or cost figure ever reaches Microsoft.
@@ -117,7 +117,7 @@ The MeetCost Teams app and Outlook add-in are a single page that serves three su
 
 Inside Teams, the client calls `microsoftTeams.authentication.getAuthToken()` to obtain the user's Microsoft-issued OIDC token. The backend verifies this token against the OIDC issuer:
 
-```
+```text
 https://login.microsoftonline.com/<MEETCOST_MICROSOFT_TENANT_ID>/v2.0
 ```
 
@@ -166,7 +166,7 @@ These permissions require **admin consent** in your tenant. The client-side regi
 
 When a Teams meeting ends, Graph publishes a `callRecord` resource and sends a change notification to your configured endpoint. Set up a subscription pointing at:
 
-```
+```http
 POST https://<your-meetcost>/webhooks/microsoft
 ```
 
@@ -174,7 +174,7 @@ Set the subscription's `clientState` to the same value as `MEETCOST_GRAPH_WEBHOO
 
 ### Validation handshake
 
-When Graph first validates the subscription URL, it sends a GET request with a `validationToken` query parameter. The MeetCost backend echoes the token as a plain-text `200` response. This is handled automatically.
+When Graph first validates a new subscription URL, it sends a POST request to the endpoint with a `validationToken` query parameter. The MeetCost backend echoes the token as a plain-text `200` response within 10 seconds. This is handled automatically.
 
 ### Notification handling
 

@@ -1,7 +1,7 @@
 ---
-title: "Authenticating with the MeetCost API"
+title: "MeetCost Bearer Token Authentication and Role Resolution"
 sidebarTitle: "Authentication"
-description: "Pass an OIDC bearer token or static service token in the Authorization header. Every endpoint except webhooks and /healthz requires authentication."
+description: "Pass an OIDC bearer token or static service token in the Authorization header. Roles are resolved server-side; no MeetCost account or password is required."
 ---
 
 MeetCost has no user accounts and no password store. Every caller either presents a token issued by your organisation's OIDC identity provider, or a static service token configured by your operator. The server verifies the token, extracts the caller's email, looks up their role, and attaches a `Principal` to the request. A token that cannot be verified is a `401`; a valid token for a role that cannot perform the requested action is a `403`.
@@ -10,7 +10,7 @@ MeetCost has no user accounts and no password store. Every caller either present
 
 Every endpoint except `/healthz`, `/readyz`, and the provider webhook receivers requires:
 
-```
+```text
 Authorization: Bearer <token>
 ```
 
@@ -42,7 +42,7 @@ The add-in clients (Google Meet, Zoom, Teams) pass the identity token that the h
 
 Webhook relays, cron jobs, CI pipelines, and any other non-human caller use a static bearer token from `MEETCOST_SERVICE_TOKENS`. This environment variable holds a comma-separated list of `name:token` pairs:
 
-```
+```text
 MEETCOST_SERVICE_TOKENS=ci-runner:s3cr3t-token-1,digest-cron:s3cr3t-token-2
 ```
 

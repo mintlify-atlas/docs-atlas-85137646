@@ -1,7 +1,7 @@
 ---
-title: "Deploy MeetCost with Docker Compose"
+title: "MeetCost Docker Compose Deployment and Configuration"
 sidebarTitle: "Docker"
-description: "Run MeetCost with Docker Compose for local trials and production deployments. Covers environment setup, database, TLS, and upgrading."
+description: "Run MeetCost locally or in production with Docker Compose. Covers key generation, environment setup, Postgres, TLS, and upgrade steps."
 ---
 
 Docker Compose is the fastest way to get MeetCost running. The bundled `docker-compose.yml` starts Postgres and the service together with a single command, and the built-in healthcheck ensures the application never starts before the database is ready. The compose file is designed for local trials and proof-of-concept work — if you want a production-grade deployment with rolling updates, resource limits, and network policies, use the [Helm chart](/deployment/kubernetes) instead. If you do choose to run Compose in production, this page covers the minimum changes required to do so safely.
@@ -183,7 +183,7 @@ Tables are created automatically at first boot — no migration command is neede
 
 The full SQLAlchemy URL format:
 
-```
+```text
 postgresql+psycopg://meetcost:PASSWORD@hostname:5432/meetcost
 ```
 

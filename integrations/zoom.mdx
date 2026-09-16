@@ -1,7 +1,7 @@
 ---
-title: "MeetCost Zoom App Setup Guide"
+title: "Zoom App Setup: Deploy MeetCost for Live Cost Tracking"
 sidebarTitle: "Zoom"
-description: "Deploy the MeetCost Zoom app to show cost estimates during Zoom meetings. Configure your Zoom OAuth credentials and webhook for attendance collection."
+description: "Host the MeetCost Zoom app for live running meeting costs. Configure server-to-server OAuth, the meeting.ended webhook, and Zoom directory sync."
 ---
 
 The MeetCost Zoom app gives meeting participants a live running cost that climbs in real time while the meeting is open — the number is visible to the people spending it, while they can still choose to finish early. Outside a meeting, the same page becomes a manual estimator for planning ahead. The app is a set of static files in `clients/zoom-app/` that you host on your own infrastructure; it sends meeting context to your MeetCost backend and renders what comes back, without ever receiving or holding pay data.
@@ -85,7 +85,7 @@ The MeetCost Zoom app gives meeting participants a live running cost that climbs
   <Step title="Configure the webhook">
     In the Zoom Marketplace app, under **Event Subscriptions**, subscribe to **Meeting → Meeting has ended** and set the notification endpoint to:
 
-    ```
+    ```http
     POST https://<your-meetcost>/webhooks/zoom
     ```
 
@@ -147,7 +147,7 @@ The URL validation handshake Zoom sends when you first configure the subscriptio
 
 ### Signature verification
 
-```
+```text
 x-zm-signature: v0=<hex digest>
 
 Message = "v0:" + x-zm-request-timestamp + ":" + raw_body

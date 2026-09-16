@@ -1,7 +1,7 @@
 ---
-title: "MeetCost Environment Variable Reference"
+title: "MeetCost Environment Variables and Configuration Reference"
 sidebarTitle: "Configuration"
-description: "Complete reference for MeetCost environment variables covering core settings, authentication, rate engine, policy defaults, integrations, and egress control."
+description: "Complete reference for every MEETCOST_ environment variable: core settings, auth, rate engine, policy defaults, integrations, notifications, and egress."
 ---
 
 MeetCost is configured entirely through environment variables with the `MEETCOST_` prefix. All variables are read from the process environment or from a `.env` file in the working directory at startup. There is no configuration file format beyond `.env` — this keeps secrets manageable via standard secret injection patterns without any MeetCost-specific tooling.
@@ -43,7 +43,7 @@ Fields containing `key`, `secret`, `password`, or `token` in their name are repl
 <ParamField body="MEETCOST_DATABASE_URL" type="string" default="sqlite+pysqlite:///./meetcost.db">
   SQLAlchemy database URL. SQLite is the default and is acceptable for local trials. Use Postgres 14 or newer in production:
 
-  ```
+  ```text
   postgresql+psycopg://meetcost:PASSWORD@hostname:5432/meetcost
   ```
 
@@ -195,6 +195,10 @@ These values also seed the `org_config` table and can be changed at runtime by a
   Client secret for the Entra app registration. Store this in your secret manager and inject at runtime — never commit it to source control.
 </ParamField>
 
+<ParamField body="MEETCOST_GRAPH_WEBHOOK_CLIENT_STATE" type="string" default="None">
+  Shared secret used to verify incoming Microsoft Graph change-notification webhooks at `POST /webhooks/microsoft`. Microsoft includes this value in every notification payload; MeetCost rejects any notification whose `clientState` field does not match. Required if you use Teams webhooks for attendance collection. Store in your secret manager.
+</ParamField>
+
 ### Zoom
 
 <ParamField body="MEETCOST_ZOOM_ACCOUNT_ID" type="string" default="None">
@@ -291,6 +295,14 @@ MeetCost derives an egress allowlist automatically from your configuration: the 
   ```
 
   If you set `MEETCOST_SERVE_CLIENTS_PATH`, the browser add-ins are served from the same origin as the API and no CORS configuration is needed.
+</ParamField>
+
+---
+
+## Clients
+
+<ParamField body="MEETCOST_SERVE_CLIENTS_PATH" type="string" default="None">
+  Absolute path to the `clients/` directory on disk. When set, the browser add-ins (Google Meet, Zoom, Teams) are served directly from this service at `/clients/...`, which makes them same-origin and removes the need to configure `MEETCOST_ALLOWED_CLIENT_ORIGINS` or set any backend URL in the add-in manifests. Unset by default — most deployments serve static files from a separate edge CDN. The Docker image pre-copies the clients to `/app/clients`; the bundled `docker-compose.yml` sets this to `/app/clients` as a convenience for local trials.
 </ParamField>
 
 ---

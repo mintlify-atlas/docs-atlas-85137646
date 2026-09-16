@@ -1,14 +1,14 @@
 ---
-title: "MeetCost HTTP API Overview"
+title: "MeetCost REST API: Conventions, Money, and Error Codes"
 sidebarTitle: "Overview"
-description: "Overview of the MeetCost REST API: base URL, versioning, content types, money encoding, redaction semantics, and error conventions."
+description: "Base URL, content type, money-as-string encoding, redaction semantics, health endpoints, and the error format used across all MeetCost API responses."
 ---
 
 MeetCost exposes a versioned REST API that every client — the Google Meet add-on, the Zoom app, the Teams tab, and your own tooling — talks to. The full interactive reference is available at `/docs` on any running deployment, and the OpenAPI document is at `/openapi.json`. This page covers the conventions and invariants that the schema alone cannot express: why money is a string, what it means when `cost.visible` is `false`, and what the health endpoints tell you about the deployment's readiness.
 
 ## Base URL
 
-```
+```text
 https://your-meetcost-domain/api/v1/
 ```
 

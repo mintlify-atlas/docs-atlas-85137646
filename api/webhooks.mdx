@@ -1,7 +1,7 @@
 ---
-title: "Webhook Endpoints for Zoom and Microsoft Teams"
-sidebarTitle: "/webhooks"
-description: "MeetCost receives end-of-meeting webhooks from Zoom and Microsoft Graph. Each webhook supplies only a meeting ID; attendance is fetched with service credentials."
+title: "Webhook Endpoints: Zoom, Microsoft Graph, and Google"
+sidebarTitle: "Webhooks"
+description: "Zoom and Microsoft Graph webhooks carry only a meeting ID. MeetCost fetches attendance via service credentials, so forged requests cannot inject cost data."
 ---
 
 MeetCost receives end-of-meeting events from Zoom and Microsoft Graph via inbound webhooks. These endpoints are unauthenticated by design — they are called by the provider's servers, not by your users — and each provider's own signature scheme is verified before any action occurs. The Google Meet path works differently: Google has no push webhook for meeting end events, so MeetCost instead exposes an authenticated poll trigger that your scheduler calls on a cron schedule.
@@ -88,10 +88,10 @@ Receives Microsoft Graph `callRecords` change notifications, and handles the sub
 
 ### Subscription validation
 
-When you create a Graph change-notification subscription, Microsoft immediately sends a GET request with a `validationToken` query parameter. MeetCost echoes this value back as plain text with `Content-Type: text/plain`, within the 10-second window Graph requires.
+When you create a Graph change-notification subscription, Microsoft sends a POST request to your endpoint with a `validationToken` query parameter. MeetCost echoes this value back as plain text with `Content-Type: text/plain`, within the 10-second window Graph requires.
 
-```
-GET /webhooks/microsoft?validationToken=abc123
+```text
+POST /webhooks/microsoft?validationToken=abc123
 → 200 OK
    Content-Type: text/plain
 
@@ -106,7 +106,7 @@ For accepted notifications, MeetCost extracts `resourceData.id` and queues an at
 
 ### clientState validation
 
-```
+```text
 MEETCOST_GRAPH_WEBHOOK_CLIENT_STATE=your-shared-secret
 ```
 

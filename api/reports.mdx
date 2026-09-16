@@ -1,10 +1,10 @@
 ---
-title: "Reports and CSV Export API Endpoints"
-sidebarTitle: "/reports"
-description: "GET /api/v1/reports returns periodic cost reports scoped to the caller's role. GET /api/v1/reports/export.csv provides an aggregate CSV download."
+title: "Periodic Meeting Cost Reports and CSV Data Exports"
+sidebarTitle: "Reports"
+description: "GET /api/v1/reports returns period cost reports scoped to the caller's role. GET /api/v1/reports/export.csv downloads the same data as aggregate-only CSV."
 ---
 
-The reports endpoints surface periodic meeting cost summaries — spend totals, recurring series run-rates, trend comparisons, and the "reduced before send" metric. The scope of what each caller can see is determined entirely by their role: there is no request parameter that widens it, and participants are excluded entirely. Both the JSON view and the CSV export are written to the audit log on every access.
+The reports endpoints surface periodic meeting-cost summaries — spend totals, recurring series run-rates, trend comparisons, and the "reduced before send" metric. The scope of what each caller sees is determined entirely by their role: there is no request parameter that widens it, and participants are blocked entirely. Both the JSON view and the CSV export are written to the audit log on every access.
 
 ---
 
@@ -13,22 +13,22 @@ The reports endpoints surface periodic meeting cost summaries — spend totals, 
 | Role | Report scope |
 |---|---|
 | `participant` | `403 Forbidden` — reports are not available |
-| `organiser` | `403 Forbidden` — the organiser role is per-meeting, not a standing reporting role |
-| `team_lead` | Meetings organised by their team only |
+| `organiser` | Meetings the caller organised (`own_meetings`) |
+| `team_lead` | Meetings organised by their team (`own_team`) |
 | `finance` | Org-wide |
 | `admin` | Org-wide |
 
 <Note>
-Scope is derived server-side from the caller's role and team assignment. You cannot pass a `scope` parameter to widen it. A `team_lead` with `team_id=eng` will always see only the engineering team's meetings, even if they request something broader.
+Scope is derived server-side from the caller's role and team assignment. There is no `scope` request parameter — a caller cannot widen their own scope. A `team_lead` assigned to `team_id=eng` will always see only that team's meetings.
 </Note>
 
 ---
 
 ## GET /api/v1/reports
 
-Returns a digest for the most recent complete period (weekly or monthly). Callers with the `team_lead` role see their team's data; callers with `finance` or `admin` see org-wide data. Participants and organisers receive `403`.
+Returns a digest for the most recent complete period (weekly or monthly). Callers with the `organiser` role see only their own meetings; `team_lead` callers see their team's data; `finance` and `admin` see org-wide data. Participants receive `403`.
 
-Both response views are recorded in the audit log.
+Both JSON and CSV responses are recorded in the audit log on every access.
 
 ### Query parameters
 
@@ -39,7 +39,7 @@ Both response views are recorded in the audit log.
 <ParamField query="anchor" type="string">
   An ISO 8601 date (`YYYY-MM-DD`). When provided, the report covers the complete period **before** this date rather than the most recent complete period. Use this to retrieve historical periods.
 
-  ```
+  ```text
   GET /api/v1/reports?period=monthly&anchor=2026-09-01
   # Returns the completed monthly period before September 1st — i.e. August.
   ```
@@ -60,7 +60,7 @@ Both response views are recorded in the audit log.
 </ResponseField>
 
 <ResponseField name="scope" type="string">
-  The scope actually applied to this report (`"team"` or `"org_wide"`), derived from the caller's role.
+  The scope actually applied to this report (`"own_meetings"`, `"own_team"`, or `"org_wide"`), derived from the caller's role.
 </ResponseField>
 
 <ResponseField name="currency" type="string">
@@ -124,7 +124,7 @@ Both response views are recorded in the audit log.
 </ResponseField>
 
 <ResponseField name="reduced_before_send" type="object | null">
-  The rollout metric showing whether organisers are acting on nudges. **Present only for org-wide scoped reports.** `null` for team-scoped reports.
+  The rollout metric showing whether organisers act on nudges. **Present only for org-wide scoped reports** (`finance` and `admin` roles). `null` for team-scoped or own-meetings reports.
 
   <Expandable title="reduced_before_send fields">
     <ResponseField name="drafts_with_revisions" type="integer">Number of drafts that were edited at least once before sending.</ResponseField>
@@ -193,9 +193,9 @@ curl "https://meetcost.acme-corp.internal/api/v1/reports?period=monthly&anchor=2
 
 ## GET /api/v1/reports/export.csv
 
-Downloads an aggregate CSV of the same report data. Same scope and auth rules as the JSON endpoint. The CSV is **aggregate-only**: no column identifies an individual person's cost, salary, or rate. Heavily audited — every export creates one audit event per actor.
+Downloads an aggregate CSV of the same report data. Applies the same role-scoping rules as the JSON endpoint — organiser, team_lead, finance, and admin callers may all call this endpoint, each receiving data at their own scope level. Participants receive `403`.
 
-**Admin only.** Finance and team_lead roles can view the JSON report but cannot download the CSV export.
+The CSV is **aggregate-only**: no column identifies an individual person's cost, salary, or rate. Every call creates an audit record.
 
 ### Query parameters
 
@@ -203,9 +203,9 @@ Same as `GET /api/v1/reports`: `period` (`weekly`|`monthly`) and optional `ancho
 
 ### Response
 
-Returns `text/csv` with a `Content-Disposition: attachment` header. The filename includes the period label and start date, e.g.:
+Returns `text/csv` with a `Content-Disposition: attachment` header. The filename includes the period label and start date:
 
-```
+```text
 Content-Disposition: attachment; filename="meetcost-2026-W35-2026-08-24.csv"
 ```
 
@@ -213,7 +213,7 @@ Content-Disposition: attachment; filename="meetcost-2026-W35-2026-08-24.csv"
 
 ```bash
 curl "https://meetcost.acme-corp.internal/api/v1/reports/export.csv?period=weekly" \
-  -H "Authorization: Bearer <admin-token>" \
+  -H "Authorization: Bearer <token>" \
   -o meetcost-report.csv
 ```
 

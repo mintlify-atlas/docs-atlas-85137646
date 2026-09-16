@@ -1,7 +1,7 @@
 ---
-title: "Writing Custom Adapters for MeetCost"
+title: "Writing Custom Adapters: Directory, HRIS, and Attendance"
 sidebarTitle: "Adapters"
-description: "Implement the DirectoryProvider, AttendanceCollector, or HRISProvider protocol to add support for a new calendar platform, HR system, or directory service."
+description: "Implement DirectoryProvider, AttendanceCollector, or HRISProvider to extend MeetCost with a new calendar platform, HR system, or directory."
 ---
 
 MeetCost is extended through adapters: small, self-contained classes that implement one of three protocols and register themselves with a decorator. Adding support for a new calendar platform, HR system, or directory service means writing one class and importing it in `adapters/__init__.py` — it never means touching the core. All bundled adapters (Google, Microsoft, Zoom, BambooHR) follow the same rules and are the best reference for what a production adapter looks like.

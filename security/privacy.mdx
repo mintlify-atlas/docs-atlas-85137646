@@ -1,7 +1,7 @@
 ---
-title: "What MeetCost Transmits and What It Keeps Private"
+title: "What MeetCost Transmits: Outbound Data and Privacy"
 sidebarTitle: "Privacy"
-description: "A precise account of every outbound connection MeetCost makes, what data crosses each wire, and how to verify these claims with tests, config inspection, and tcpdump."
+description: "Every outbound connection MeetCost makes, what data crosses each wire, and how to verify these claims using the test suite, config inspection, and tcpdump."
 ---
 
 MeetCost exists because meeting-cost tools are normally SaaS, and using them means shipping payroll data to a third party. This page states precisely what crosses which wire — including the parts that are less comfortable — and explains the enforcement mechanism that backs each claim. It is the document to check first, and to hold the project to. The claims here are asserted by `server/tests/test_no_egress.py`, which runs on every commit. If a claim below stops being true, that test fails.

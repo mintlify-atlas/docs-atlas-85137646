@@ -193,7 +193,7 @@ curl -s -X PATCH localhost:8000/api/v1/admin/config \
 ```
 GET    /api/v1/admin/roles
 PUT    /api/v1/admin/roles
-DELETE /api/v1/admin/roles
+DELETE /api/v1/admin/roles/{email}
 ```
 
 Available roles are `participant`, `organiser`, `team_lead`, `finance`, and `admin`. Team lead assignments include a `team_id` to scope their report access:
@@ -235,7 +235,7 @@ Audited actions include:
 | `pay.import` | CSV upload or manual entry |
 | `pay.delete` | `DELETE /api/v1/admin/pay/{email}` |
 | `config.update` | `PATCH /api/v1/admin/config` (before/after values recorded) |
-| `role.grant` / `role.revoke` | `PUT` / `DELETE /api/v1/admin/roles` |
+| `role.grant` / `role.revoke` | `PUT /api/v1/admin/roles` / `DELETE /api/v1/admin/roles/{email}` |
 | `report.view` / `report.export` | `GET /api/v1/reports` and `GET /api/v1/reports/export.csv` |
 | `breakdown.view` | Per-person breakdown accessed in a summary |
 | `directory.sync` / `hris.sync` | Manual or scheduled sync |
@@ -243,11 +243,17 @@ Audited actions include:
 ## Directory and HRIS sync
 
 ```
+GET  /api/v1/admin/directory
 POST /api/v1/admin/sync/directory
 POST /api/v1/admin/sync/hris
+GET  /api/v1/admin/sync-state
 ```
 
-Trigger an immediate sync rather than waiting for the next scheduled pull. Both endpoints return the number of records created, updated, and skipped.
+`GET /api/v1/admin/directory` lists all persons currently in the org directory, including their display name, team, department, active status, and the timestamp of the last sync.
+
+`POST /api/v1/admin/sync/directory` and `POST /api/v1/admin/sync/hris` trigger an immediate pull rather than waiting for the next scheduled run. Both return the number of records created, updated, and deactivated. Pass `?provider=<name>` to `sync/directory` to target a single configured provider.
+
+`GET /api/v1/admin/sync-state` returns the last-run and last-success timestamps for every adapter, plus a record count and the last error string if any — the backing data for the staleness reminder.
 
 To check which adapters have credentials configured:
 
